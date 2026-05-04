@@ -78,8 +78,13 @@ musiktool calibrate -o ~/tape-projects --sample-rate 44100 --bit-depth 24
 ### 3. Analyze Your Library (once)
 
 ```bash
-musiktool analyze ~/Music --db ~/tape-projects/analytics.db
+musiktool analyze ~/Music
 ```
+
+Tape commands read the default analytics database at
+`~/.local/share/musiktool/analytics.db`. The `analyze --db` option is for
+standalone/custom analysis workflows and is not used by `musiktool tape`
+commands in this version.
 
 ### 4. Create a Tape Project
 

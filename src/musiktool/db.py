@@ -3,7 +3,12 @@
 import sqlite3
 from pathlib import Path
 
+from musiktool.constants import MEDIUM_PRESETS
+
 DEFAULT_DB_DIR = Path.home() / ".local" / "share" / "musiktool"
+
+HARD_CLIP_DEFAULT_PEAK_CEILING_DBTP = -1.0
+LEGACY_HARD_CLIP_PEAK_CEILING_DBTP = 0.0
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS track_loudness (
@@ -107,6 +112,35 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE tape_item ADD COLUMN side TEXT DEFAULT NULL",
         )
+
+    _migrate_hard_clip_peak_ceiling(conn)
+    conn.commit()
+
+
+def _migrate_hard_clip_peak_ceiling(conn: sqlite3.Connection) -> None:
+    """Move legacy hard-clip projects from 0 dBTP to the -1 dBTP default."""
+    hard_clip_media = sorted(
+        name
+        for name, preset in MEDIUM_PRESETS.items()
+        if preset.get("peak_behavior") == "hard"
+    )
+    if not hard_clip_media:
+        return
+
+    placeholders = ",".join("?" for _ in hard_clip_media)
+    conn.execute(
+        f"""\
+        UPDATE tape_project
+        SET peak_ceiling_dbtp = ?
+        WHERE peak_ceiling_dbtp = ?
+          AND medium IN ({placeholders})
+        """,
+        (
+            HARD_CLIP_DEFAULT_PEAK_CEILING_DBTP,
+            LEGACY_HARD_CLIP_PEAK_CEILING_DBTP,
+            *hard_clip_media,
+        ),
+    )
 
 
 def get_track(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from musiktool import db
-from musiktool.constants import MEDIUM_PRESETS
+from musiktool.constants import MEDIUM_PRESETS, TRANSPARENT_LIMITING_BUDGET_DB
 from musiktool.exceptions import (
     AudioReadError,
     InvalidMediumError,
@@ -17,6 +17,8 @@ from musiktool.exceptions import (
     ProjectNotFoundError,
     ValidationError,
 )
+
+CAPACITY_WARNING_GRACE_SEC = 60.0
 
 
 def create_project(
@@ -34,7 +36,7 @@ def create_project(
     marker_level_dbfs: float = -30,
     marker_duration_sec: float = 0.5,
     target_lufs: float = -14,
-    peak_ceiling_dbtp: float = 0,
+    peak_ceiling_dbtp: float | None = None,
     sample_rate: str = "auto",
     bit_depth: int = 24,
     use_limiter: bool = False,
@@ -52,6 +54,8 @@ def create_project(
         duration_sec = duration_min * 60
         side_a_duration_sec = None
         side_b_duration_sec = None
+        if peak_ceiling_dbtp is None:
+            peak_ceiling_dbtp = -1.0
     else:
         if medium not in MEDIUM_PRESETS:
             raise InvalidMediumError(
@@ -66,6 +70,8 @@ def create_project(
         else:
             side_a_duration_sec = None
             side_b_duration_sec = None
+        if peak_ceiling_dbtp is None:
+            peak_ceiling_dbtp = -1.0 if preset["peak_behavior"] == "hard" else 0.0
 
     now = datetime.now(timezone.utc).isoformat()
     return db.create_tape_project(
@@ -344,6 +350,25 @@ def format_duration(seconds: float) -> str:
     if h > 0:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _exceeds_capacity_warning_grace(total_sec: float, capacity_sec: float) -> bool:
+    """Return true when duration is beyond the nominal capacity grace window."""
+    return total_sec - capacity_sec > CAPACITY_WARNING_GRACE_SEC
+
+
+def _remaining_exceeds_capacity_warning_grace(remaining_sec: float) -> bool:
+    """Return true when negative remaining time is beyond the grace window."""
+    return remaining_sec < -CAPACITY_WARNING_GRACE_SEC
+
+
+def _capacity_status(total_sec: float, capacity_sec: float) -> str:
+    """Classify duration against nominal capacity plus a small media grace window."""
+    if _exceeds_capacity_warning_grace(total_sec, capacity_sec):
+        return "OVER"
+    if total_sec > capacity_sec:
+        return "grace"
+    return "fits"
 
 
 # --- Layout dataclasses ---
@@ -681,8 +706,11 @@ def _format_side_compact(
     lines.append(f"  Content:  {content:>8s}")
     lines.append(f"  Overhead: {overhead:>8s}  ({parts})")
     lines.append(f"  Total:    {total:>8s}")
-    if side_layout.remaining_sec < 0:
+    if _remaining_exceeds_capacity_warning_grace(side_layout.remaining_sec):
         lines.append(f"  OVER BY:  {remaining:>8s}  !")
+    elif side_layout.remaining_sec < 0:
+        grace = format_duration(CAPACITY_WARNING_GRACE_SEC)
+        lines.append(f"  Over by:  {remaining:>8s}  (within {grace} grace)")
     else:
         lines.append(f"  Remaining:{remaining:>8s}")
 
@@ -783,8 +811,11 @@ def _format_side_timeline(
     lines.append("")
 
     remaining = format_duration(abs(side_layout.remaining_sec))
-    if side_layout.remaining_sec < 0:
+    if _remaining_exceeds_capacity_warning_grace(side_layout.remaining_sec):
         lines.append(f"  OVER BY: {remaining}")
+    elif side_layout.remaining_sec < 0:
+        grace = format_duration(CAPACITY_WARNING_GRACE_SEC)
+        lines.append(f"  Over by: {remaining} (within {grace} grace)")
     else:
         lines.append(f"  Remaining: {remaining}")
 
@@ -869,6 +900,128 @@ def find_best_split(track_durations: list[float], available_sec: float) -> int:
     return len(track_durations)
 
 
+def _side_sort_key(a: SideAssignment) -> tuple[int, int]:
+    """Sort assignments in final playback order within a side."""
+    split_order = 0 if a.track_range is None or a.track_range[0] == 0 else 1
+    return (a.position, split_order)
+
+
+def _sorted_side(assignments: list[SideAssignment]) -> list[SideAssignment]:
+    """Return side assignments sorted in final playback order."""
+    return sorted(assignments, key=_side_sort_key)
+
+
+def _assignment_gap(
+    prev_type: str | None,
+    curr_type: str,
+    album_gap_sec: float,
+    track_gap_sec: float,
+) -> float:
+    """Gap between adjacent side assignments using project gap rules."""
+    if prev_type is None:
+        return 0.0
+    if prev_type == "track" and curr_type == "track":
+        return track_gap_sec
+    return album_gap_sec
+
+
+def _side_assignments_total_sec(
+    assignments: list[SideAssignment],
+    lead_in_sec: float,
+    lead_out_sec: float,
+    album_gap_sec: float,
+    track_gap_sec: float,
+) -> float:
+    """Compute final side duration for assignments in playback order."""
+    total = lead_in_sec + lead_out_sec
+    prev_type = None
+    for a in _sorted_side(assignments):
+        total += _assignment_gap(
+            prev_type, a.item_type, album_gap_sec, track_gap_sec,
+        )
+        total += a.duration_sec
+        prev_type = a.item_type
+    return total
+
+
+def _side_fits(
+    assignments: list[SideAssignment],
+    capacity_sec: float,
+    lead_in_sec: float,
+    lead_out_sec: float,
+    album_gap_sec: float,
+    track_gap_sec: float,
+) -> bool:
+    """Return whether assignments fit a side when sorted into final order."""
+    return (
+        _side_assignments_total_sec(
+            assignments,
+            lead_in_sec,
+            lead_out_sec,
+            album_gap_sec,
+            track_gap_sec,
+        )
+        <= capacity_sec
+    )
+
+
+def _assignment_from_item(
+    side: str,
+    item: SideItem,
+    *,
+    duration_sec: float | None = None,
+    track_range: tuple[int, int] | None = None,
+) -> SideAssignment:
+    """Build a side assignment from an input item."""
+    return SideAssignment(
+        side=side,
+        position=item.position,
+        item_type=item.item_type,
+        path=item.path,
+        duration_sec=item.duration_sec if duration_sec is None else duration_sec,
+        track_range=track_range,
+    )
+
+
+def _best_split_for_side(
+    side_assignments: list[SideAssignment],
+    item: SideItem,
+    side_capacity_sec: float,
+    lead_in_sec: float,
+    lead_out_sec: float,
+    album_gap_sec: float,
+    track_gap_sec: float,
+) -> int:
+    """Find the largest album prefix that fits the side in final order."""
+    if item.item_type != "album" or not item.track_durations:
+        return 0
+
+    best = 0
+    prefix_duration = 0.0
+    # Only return a real split point; full-album fit is handled before this.
+    for split_point, track_duration in enumerate(item.track_durations[:-1], 1):
+        prefix_duration += track_duration
+        candidate = _assignment_from_item(
+            "a",
+            item,
+            duration_sec=prefix_duration,
+            track_range=(0, split_point),
+        )
+        if _side_fits(
+            side_assignments + [candidate],
+            side_capacity_sec,
+            lead_in_sec,
+            lead_out_sec,
+            album_gap_sec,
+            track_gap_sec,
+        ):
+            best = split_point
+        else:
+            break
+
+    return best
+
+
 def assign_sides(
     items: list[SideItem],
     side_a_sec: float,
@@ -887,126 +1040,68 @@ def assign_sides(
     if not items:
         return []
 
-    side_overhead = lead_in_sec + lead_out_sec
+    side_a: list[SideAssignment] = [
+        _assignment_from_item("a", it) for it in items if it.pinned_side == "a"
+    ]
+    side_b: list[SideAssignment] = [
+        _assignment_from_item("b", it) for it in items if it.pinned_side == "b"
+    ]
 
-    # Separate pinned from auto items (preserve order)
-    pinned_a = [it for it in items if it.pinned_side == "a"]
-    pinned_b = [it for it in items if it.pinned_side == "b"]
-    auto = [it for it in items if it.pinned_side is None]
+    overflow_to_b = False
 
-    # Compute pinned consumption per side (with gaps between pinned items)
-    def _pinned_duration(pinned: list[SideItem]) -> float:
-        total = 0.0
-        prev_type = None
-        for it in pinned:
-            if prev_type is not None:
-                if prev_type == "track" and it.item_type == "track":
-                    total += track_gap_sec
-                else:
-                    total += album_gap_sec
-            total += it.duration_sec
-            prev_type = it.item_type
-        return total
-
-    pinned_a_dur = _pinned_duration(pinned_a)
-    pinned_b_dur = _pinned_duration(pinned_b)
-
-    # Available capacity for auto items on each side
-    capacity_a = side_a_sec - side_overhead - pinned_a_dur
-    capacity_b = side_b_sec - side_overhead - pinned_b_dur
-
-    # Account for gaps between pinned and auto items
-    last_pinned_a_type = pinned_a[-1].item_type if pinned_a else None
-    last_pinned_b_type = pinned_b[-1].item_type if pinned_b else None
-
-    # Fill side A with auto items
-    assignments: list[SideAssignment] = []
-
-    # Add pinned A items
-    for it in pinned_a:
-        assignments.append(SideAssignment(
-            side="a", position=it.position, item_type=it.item_type,
-            path=it.path, duration_sec=it.duration_sec,
-        ))
-
-    cursor_a = 0.0
-    prev_auto_a_type = last_pinned_a_type
-    side_b_auto: list[SideItem] = []
-    split_happened = False
-
-    for it in auto:
-        if split_happened:
-            side_b_auto.append(it)
+    for it in items:
+        if it.pinned_side is not None:
             continue
 
-        # Gap between previous item on A and this one
-        gap = 0.0
-        if prev_auto_a_type is not None:
-            if prev_auto_a_type == "track" and it.item_type == "track":
-                gap = track_gap_sec
-            else:
-                gap = album_gap_sec
+        assignment_a = _assignment_from_item("a", it)
+        if not overflow_to_b and _side_fits(
+            side_a + [assignment_a],
+            side_a_sec,
+            lead_in_sec,
+            lead_out_sec,
+            album_gap_sec,
+            track_gap_sec,
+        ):
+            side_a.append(assignment_a)
+            continue
 
-        needed = gap + it.duration_sec
-        if cursor_a + needed <= capacity_a:
-            # Fits on side A
-            assignments.append(SideAssignment(
-                side="a", position=it.position, item_type=it.item_type,
-                path=it.path, duration_sec=it.duration_sec,
-            ))
-            cursor_a += needed
-            prev_auto_a_type = it.item_type
-        else:
-            # Doesn't fit entirely — try splitting if album
-            remaining_a = capacity_a - cursor_a - gap
-            if (
-                it.item_type == "album"
-                and it.track_durations
-                and remaining_a > 0
-            ):
-                split_point = find_best_split(it.track_durations, remaining_a)
-                if 0 < split_point < len(it.track_durations):
-                    # Split album across sides
-                    dur_a = sum(it.track_durations[:split_point])
-                    dur_b = sum(it.track_durations[split_point:])
-                    assignments.append(SideAssignment(
-                        side="a", position=it.position, item_type="album",
-                        path=it.path, duration_sec=dur_a,
-                        track_range=(0, split_point),
-                    ))
-                    assignments.append(SideAssignment(
-                        side="b", position=it.position, item_type="album",
-                        path=it.path, duration_sec=dur_b,
-                        track_range=(split_point, len(it.track_durations)),
-                    ))
-                    split_happened = True
-                    continue
+        if not overflow_to_b:
+            split_point = _best_split_for_side(
+                side_a,
+                it,
+                side_a_sec,
+                lead_in_sec,
+                lead_out_sec,
+                album_gap_sec,
+                track_gap_sec,
+            )
+            if 0 < split_point < len(it.track_durations or []):
+                dur_a = sum(it.track_durations[:split_point])
+                dur_b = sum(it.track_durations[split_point:])
+                side_a.append(_assignment_from_item(
+                    "a",
+                    it,
+                    duration_sec=dur_a,
+                    track_range=(0, split_point),
+                ))
+                side_b.append(_assignment_from_item(
+                    "b",
+                    it,
+                    duration_sec=dur_b,
+                    track_range=(split_point, len(it.track_durations)),
+                ))
+                overflow_to_b = True
+                continue
 
-            # Can't split or single track — whole item to side B
-            side_b_auto.append(it)
-            split_happened = True
+        side_b.append(_assignment_from_item("b", it))
+        overflow_to_b = True
 
-    # Add pinned B items
-    for it in pinned_b:
-        assignments.append(SideAssignment(
-            side="b", position=it.position, item_type=it.item_type,
-            path=it.path, duration_sec=it.duration_sec,
-        ))
-
-    # Add remaining auto items to side B
-    for it in side_b_auto:
-        assignments.append(SideAssignment(
-            side="b", position=it.position, item_type=it.item_type,
-            path=it.path, duration_sec=it.duration_sec,
-        ))
-
-    return assignments
+    return _sorted_side(side_a) + _sorted_side(side_b)
 
 
 # --- Tape analysis ---
 
 PEAK_CEILING_DBTP = 0.0
-LRA_WARNING_THRESHOLD = 20.0  # LU
 LUFS_SPREAD_WARNING_THRESHOLD = 10.0  # dB
 
 
@@ -1046,6 +1141,7 @@ class AnalysisResult:
     warnings: list[str] = field(default_factory=list)
     use_limiter: bool = False
     use_compressor: bool = False
+    side_durations: list[tuple[str, float, float]] = field(default_factory=list)
 
 
 def _collect_sample_rates(
@@ -1054,17 +1150,15 @@ def _collect_sample_rates(
     """Collect sample rates from all source tracks via mutagen."""
     import mutagen
 
-    from musiktool.constants import AUDIO_EXTENSIONS
+    from musiktool.constants import collect_audio_files
 
     rates: Counter[int] = Counter()
     for item in items:
         if item["item_type"] == "album":
-            album_dir = Path(item["path"])
-            for f in sorted(album_dir.iterdir()):
-                if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS:
-                    mf = mutagen.File(str(f))
-                    if mf is not None and mf.info is not None:
-                        rates[mf.info.sample_rate] += 1
+            for f in collect_audio_files(Path(item["path"])):
+                mf = mutagen.File(str(f))
+                if mf is not None and mf.info is not None:
+                    rates[mf.info.sample_rate] += 1
         else:
             mf = mutagen.File(item["path"])
             if mf is not None and mf.info is not None:
@@ -1100,22 +1194,32 @@ def _compute_gain(
     true_peak_dbtp: float,
     target_lufs: float,
     peak_ceiling_dbtp: float = PEAK_CEILING_DBTP,
+    limiting_budget_db: float = TRANSPARENT_LIMITING_BUDGET_DB,
 ) -> tuple[float, float, bool, float]:
-    """Compute gain, resulting peak, limiter flag, and penalty.
+    """Compute gain with bounded peak limiting.
+
+    The limiting budget determines how many dB of peak limiting is acceptable
+    to reach (or approach) target LUFS. Gain is applied up to
+    max_safe_gain + budget, with the limiter catching the excess peaks.
 
     Returns (gain_db, peak_after_gain, needs_limiter, limiter_penalty_db).
+    - gain_db: actual gain applied
+    - peak_after_gain: true peak after gain (before limiter)
+    - needs_limiter: True if gain pushes peaks above ceiling
+    - limiter_penalty_db: how much quieter than target due to budget exhaustion
     """
     desired_gain = target_lufs - measured_lufs
     max_safe_gain = peak_ceiling_dbtp - true_peak_dbtp
 
     if desired_gain <= max_safe_gain:
-        # Can reach target without clipping
         return desired_gain, true_peak_dbtp + desired_gain, False, 0.0
-    else:
-        # Peak-limited: cap gain to stay under ceiling
-        gain = max_safe_gain
-        penalty = desired_gain - max_safe_gain
-        return gain, true_peak_dbtp + gain, True, penalty
+
+    # Peaks prevent reaching target. Apply gain up to budget.
+    gain = min(desired_gain, max_safe_gain + limiting_budget_db)
+    peak_after = true_peak_dbtp + gain
+    penalty = desired_gain - gain
+    needs_limiter = gain > max_safe_gain
+    return gain, peak_after, needs_limiter, penalty
 
 
 def _compute_gain_with_limiter(
@@ -1125,21 +1229,18 @@ def _compute_gain_with_limiter(
     peak_ceiling_dbtp: float = PEAK_CEILING_DBTP,
     use_limiter: bool = False,
 ) -> tuple[float, float, bool, float]:
-    """Compute gain, optionally using full desired gain when limiter is enabled.
+    """Compute gain with optional unlimited limiting budget.
 
-    When use_limiter is True and the item needs limiting, returns the full
-    desired gain instead of the reduced safe gain. The limiter filter in
-    the rendering pipeline will catch peaks above the ceiling.
+    When use_limiter is False: uses TRANSPARENT_LIMITING_BUDGET_DB (3 dB).
+    When use_limiter is True: unlimited budget (full desired gain applied).
 
     Returns (gain_db, peak_after_gain, needs_limiter, limiter_penalty_db).
     """
-    gain, peak_after, needs_limiter, penalty = _compute_gain(
+    budget = float("inf") if use_limiter else TRANSPARENT_LIMITING_BUDGET_DB
+    return _compute_gain(
         measured_lufs, true_peak_dbtp, target_lufs, peak_ceiling_dbtp,
+        limiting_budget_db=budget,
     )
-    if use_limiter and needs_limiter:
-        desired_gain = target_lufs - measured_lufs
-        return desired_gain, true_peak_dbtp + desired_gain, True, 0.0
-    return gain, peak_after, needs_limiter, penalty
 
 
 def _compute_compressor_params(
@@ -1151,7 +1252,7 @@ def _compute_compressor_params(
     Returns dict with threshold, ratio, attack, release, knee
     or None if no compression needed.
     """
-    lra_limit = min(medium_dynamic_range_db * 0.25, LRA_WARNING_THRESHOLD)
+    lra_limit = medium_dynamic_range_db * 0.25
     if lra <= lra_limit:
         return None
 
@@ -1184,9 +1285,14 @@ def analyze_project(
 
     target = project["target_lufs"]
     medium = project["medium"]
-    use_lim = bool(project["use_limiter"])
+    user_limiter = bool(project["use_limiter"])
     use_comp = bool(project["use_compressor"])
-    medium_dr = MEDIUM_PRESETS.get(medium, {}).get("dynamic_range_db", 80)
+    medium_dr = MEDIUM_PRESETS.get(medium, {}).get("dynamic_range_db", 90)
+    peak_behavior = MEDIUM_PRESETS.get(medium, {}).get("peak_behavior", "hard")
+    # Render limiter is present when: user opted in, hard-clip medium,
+    # or any item's gain exceeds max_safe (budget applied limiting).
+    # Computed per-item below — base flag for hard-clip safety.
+    hard_clip_safety = peak_behavior == "hard"
 
     # Sample rate resolution
     source_rates = _collect_sample_rates(conn, db_items)
@@ -1208,10 +1314,10 @@ def analyze_project(
 
         gain, peak_after, needs_limiter, penalty = _compute_gain_with_limiter(
             it.lufs, it.peak, target, project["peak_ceiling_dbtp"],
-            use_limiter=use_lim,
+            use_limiter=user_limiter,
         )
 
-        lra_warn = it.lra > LRA_WARNING_THRESHOLD
+        lra_warn = it.lra > medium_dr * 0.25
 
         comp_params = None
         if use_comp:
@@ -1230,7 +1336,7 @@ def analyze_project(
             needs_limiter=needs_limiter,
             limiter_penalty_db=penalty,
             lra_warning=lra_warn,
-            use_limiter=use_lim,
+            use_limiter=needs_limiter or hard_clip_safety or user_limiter,
             use_compressor=use_comp,
             compressor_params=comp_params,
         ))
@@ -1244,7 +1350,24 @@ def analyze_project(
     lra_max = max(all_lra)
 
     # Build warnings
-    if layout.remaining_sec < 0:
+    if medium == "vinyl-lp":
+        warnings.append(
+            "Vinyl mastering constraints not implemented (bass mono, "
+            "de-essing, HF rolloff). Use for duration/side planning only "
+            "\u2014 do not send this master to a cutting engineer without "
+            "additional processing."
+        )
+
+    if layout.is_two_sided:
+        for side_label, side_layout in [("A", layout.side_a), ("B", layout.side_b)]:
+            if _remaining_exceeds_capacity_warning_grace(side_layout.remaining_sec):
+                over = format_duration(abs(side_layout.remaining_sec))
+                cap = format_duration(side_layout.capacity_sec)
+                total = format_duration(side_layout.total_sec)
+                warnings.append(
+                    f"Side {side_label}: {total} exceeds capacity {cap} by {over}"
+                )
+    elif _remaining_exceeds_capacity_warning_grace(layout.remaining_sec):
         over = format_duration(abs(layout.remaining_sec))
         cap = format_duration(project["duration_sec"])
         total = format_duration(layout.total_sec)
@@ -1264,20 +1387,17 @@ def analyze_project(
                 f"may exceed medium dynamic range"
             )
         if ia.needs_limiter:
-            if use_lim:
+            limiter_work = ia.gain_db - (project["peak_ceiling_dbtp"] - ia.true_peak)
+            if user_limiter:
                 warnings.append(
                     f"Item {ia.position} limiter active: "
                     f"gain {ia.gain_db:+.1f} dB, "
                     f"peaks limited to {project['peak_ceiling_dbtp']:.1f} dBTP"
                 )
-            else:
-                full_gain = ia.gain_db + ia.limiter_penalty_db
-                full_peak = ia.true_peak + full_gain
+            elif ia.limiter_penalty_db > 0:
                 warnings.append(
-                    f"Item {ia.position} gain {full_gain:+.1f} dB "
-                    f"would push peak to {full_peak:.1f} dBTP "
-                    f"— limiter recommended "
-                    f"(penalty {ia.limiter_penalty_db:.1f} dB without)"
+                    f"Item {ia.position} limiting {limiter_work:.1f} dB (budget), "
+                    f"penalty {ia.limiter_penalty_db:.1f} dB below target"
                 )
         if ia.compressor_params is not None:
             warnings.append(
@@ -1298,8 +1418,16 @@ def analyze_project(
         duration_total_sec=layout.total_sec,
         duration_capacity_sec=project["duration_sec"],
         warnings=warnings,
-        use_limiter=use_lim,
+        use_limiter=any(ia.use_limiter for ia in item_analyses),
         use_compressor=use_comp,
+        side_durations=(
+            [
+                ("A", layout.side_a.total_sec, layout.side_a.capacity_sec),
+                ("B", layout.side_b.total_sec, layout.side_b.capacity_sec),
+            ]
+            if layout.is_two_sided
+            else []
+        ),
     )
 
 
@@ -1312,7 +1440,11 @@ def format_analysis(result: AnalysisResult) -> str:
     if result.use_limiter or result.use_compressor:
         modes = []
         if result.use_limiter:
-            modes.append("limiter")
+            peak_behavior = MEDIUM_PRESETS.get(result.medium, {}).get("peak_behavior", "hard")
+            if peak_behavior == "hard":
+                modes.append("limiter (hard-clip safety)")
+            else:
+                modes.append("limiter")
         if result.use_compressor:
             modes.append("compressor")
         lines.append(f"  Processing: {', '.join(modes)} enabled")
@@ -1371,10 +1503,22 @@ def format_analysis(result: AnalysisResult) -> str:
     lines.append(f"  LUFS spread:  {result.lufs_spread:.1f} dB ({spread_note})")
     lines.append(f"  LRA range:    {result.lra_min:.1f} - {result.lra_max:.1f} LU")
 
-    total = format_duration(result.duration_total_sec)
-    cap = format_duration(result.duration_capacity_sec)
-    fits = "fits" if result.duration_total_sec <= result.duration_capacity_sec else "OVER"
-    lines.append(f"  Duration:     {total} / {cap} ({fits})")
+    if result.side_durations:
+        side_parts = []
+        for label, total_sec, capacity_sec in result.side_durations:
+            total = format_duration(total_sec)
+            cap = format_duration(capacity_sec)
+            fits = _capacity_status(total_sec, capacity_sec)
+            side_parts.append(f"Side {label} {total} / {cap} ({fits})")
+        lines.append(f"  Duration:     {'; '.join(side_parts)}")
+    else:
+        total = format_duration(result.duration_total_sec)
+        cap = format_duration(result.duration_capacity_sec)
+        fits = _capacity_status(
+            result.duration_total_sec,
+            result.duration_capacity_sec,
+        )
+        lines.append(f"  Duration:     {total} / {cap} ({fits})")
 
     lines.append("")
 
@@ -1392,13 +1536,9 @@ def format_analysis(result: AnalysisResult) -> str:
 
 def _collect_album_tracks(album_path: str) -> list[str]:
     """Collect sorted audio file paths in an album directory."""
-    from musiktool.constants import AUDIO_EXTENSIONS
+    from musiktool.constants import collect_audio_files
 
-    d = Path(album_path)
-    return [
-        str(f) for f in sorted(d.iterdir())
-        if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
-    ]
+    return [str(f) for f in collect_audio_files(Path(album_path))]
 
 
 def _build_gap_segments(
@@ -1464,7 +1604,7 @@ def build_tape_segments(
 
         # Compute per-item processing params
         limiter_limit = None
-        if ia.use_limiter and ia.needs_limiter:
+        if ia.use_limiter:
             limiter_limit = 10 ** (project["peak_ceiling_dbtp"] / 20)
 
         # Item content

@@ -23,29 +23,234 @@ The session is the unit of mastering — all material in a session must be analy
 
 ### Medium Profile
 
-Each output medium has physical constraints:
+Each output medium has physical constraints. The key variable is
+**dynamic range** — it determines when the compressor triggers. All other
+rendering parameters (target LUFS, peak ceiling, gap durations) are
+constant across media.
 
-| Property | Digital | VHS (Hi-Fi) | Cassette | Broadcast |
-|----------|---------|-------------|----------|-----------|
-| Dynamic range | ~144 dB (24-bit) | ~80 dB | ~55-65 dB | per spec |
-| Target LUFS | -14 | medium-dependent | medium-dependent | -23 (EBU R128) |
-| Peak ceiling | -1 dBTP | soft (saturation) | soft (saturation) | -1 dBTP |
-| Duration limit | unlimited | ~180 min (T-120) | 45/60/90 min | unlimited |
-| Lead-in | none | 15 s silence | 5 s silence | none |
-| Lead-out | none | 15 s silence | 5 s silence | none |
-| Inter-album gap | 3 s | 5 s silence | 5 s silence | per schedule |
+| Property | VHS Hi-Fi | Cassette (Type I–IV) | Open Reel | MiniDisc | Vinyl LP |
+|----------|-----------|---------------------|-----------|----------|----------|
+| Dynamic range | 90 dB | 55–98 dB | 65–96 dB | 93 dB | 70 dB |
+| Signal encoding | FM | Amplitude | Amplitude | Digital (ATRAC) | Mechanical |
+| Peak behavior | Hard clip | Soft saturation | Soft saturation | Hard clip | Groove limit |
+| Duration | 118–176 min | 30–60 min/side | 15–60 min | 60–80 min | 22 min/side |
+| Sides | 1 | 2 | 1 | 1 | 2 |
 
-Lead-in and lead-out are mandatory silent sections at the start/end of the medium. Tape stock at these positions may produce degraded audio (stretch, oxide irregularities). The lead-in/lead-out durations are configurable per profile.
+Dynamic range varies widely within cassette and open reel because it
+depends on tape type and noise reduction:
 
-## Gain Calculation
+| Configuration | Dynamic Range | Compressor triggers at LRA > |
+|---------------|--------------|------------------------------|
+| Cassette Type I, no NR | 57 dB | 14.25 LU |
+| Cassette Type II, Dolby B | 75 dB | 18.75 LU |
+| Cassette Type IV, Dolby C | 94 dB | 23.5 LU |
+| Open reel half-track, no NR | 65–66 dB | 16.25 LU |
+| Open reel + Dolby SR | 87–88 dB | 21.75–22.0 LU |
+| VHS Hi-Fi | 90 dB | 22.5 LU |
+| MiniDisc SP | 93 dB | 23.25 LU |
+
+See `medium-selection-guide.md` for the full preset reference (61 presets
+covering all practical tape type + NR combinations, plus CD-DA and vinyl).
+
+Lead-in and lead-out are mandatory silent sections at the start/end of the
+medium. Tape stock at these positions may produce degraded audio (stretch,
+oxide irregularities). The lead-in/lead-out durations are configurable per
+profile.
+
+## Architecture: Digital vs Physical Domain
+
+The rendering pipeline operates entirely in the digital domain. Physical
+medium characteristics (tape saturation, NR encoding, EQ curves) are
+handled by the recording equipment after the DAC.
+
+### Signal Level Diagram
 
 ```
-gain = min(target_LUFS - measured_LUFS, -(true_peak_dBTP + headroom))
+                         0 dBFS (digital ceiling)
+                            │
+    ┌── peaks ──────────────┤  ← limiter catches up to 3 dB
+    │                       │    automatically (budget)
+    │   ← dynamic range →  │
+    │                       │
+    ├── average (-14 LUFS) ─┤  ← calibration maps THIS to the
+    │                       │    correct recording level on
+    │   ← dynamic range →  │    the deck's meters
+    │                       │
+    ├── quiet passages ─────┤
+    │                       │
+    │   ... margin ...      │  ← must exist, or tape hiss
+    │                       │    becomes audible
+    └── noise floor ────────┤  ← determined by medium
+                                 (tape type + noise reduction)
+```
+
+Peak ceiling depends on medium type:
+- Hard-clip media (VHS, MD, CD): ceiling -1 dBTP (intersample safety)
+- Soft-clip media (cassette, reel): ceiling 0 dBTP (tape saturates gently)
+
+### Four Independent Concerns
+
+**1. Target LUFS** — where the average sits in the digital window.
+Constant at -14 LUFS across all media. The calibration procedure maps
+this to the correct physical recording level for each medium.
+
+**2. Calibration** — the bridge between digital and physical. Maps the
+DAC's output to the deck's meters. One-time procedure per equipment
+setup. NOT part of the rendering pipeline.
+
+**3. Limiting budget** — when gain to reach target LUFS would push peaks
+above ceiling, up to 3 dB of transparent peak limiting is applied
+automatically. Beyond 3 dB, gain is reduced (album plays quieter than
+target). With `--limiter`, the budget is unlimited. See "Gain Alignment
+& Limiting Budget" section below.
+
+**4. Compression** — the only decision driven by `dynamic_range_db`.
+When an album's LRA exceeds what the medium can capture (quiet passages
+would fall below the noise floor), gentle compression reduces the range
+to fit.
+
+### Signal Flow
+
+```
+    Source Album (measured: LUFS, true peak, LRA)
+             │
+             ▼
+    ┌─────────────────────────────────────┐
+    │     GAIN + LIMITING BUDGET          │
+    │  gain = target_LUFS - measured_LUFS │
+    │  bounded by ceiling + 3 dB budget   │
+    │  --limiter: unlimited budget        │
+    └─────────────────────────────────────┘
+             │
+             ▼
+    ┌─────────────────────────────────────┐
+    │     COMPRESSION DECISION            │
+    │  Does LRA exceed medium's window?   │
+    │  Varies per medium subtype.         │
+    │  Driven by dynamic_range_db.        │
+    └─────────────────────────────────────┘
+             │
+             ▼
+    ┌─────────────────────────────────────┐
+    │         PEAK LIMITER                │
+    │  Catches peaks above ceiling.       │
+    │  Always present for hard-clip.      │
+    │  Present when budget applied gain   │
+    │  beyond max_safe.                   │
+    └─────────────────────────────────────┘
+             │
+             ▼
+        Digital Master (FLAC)
+             │
+             ▼
+    ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+    │         CALIBRATION                 │
+      Maps digital output to physical.
+    │ One-time, per equipment setup.      │
+      NOT part of rendering pipeline.
+    │                                     │
+    └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+             │
+             ▼
+        Physical Medium
+```
+
+## Gain Alignment & Limiting Budget
+
+### The Problem
+
+Albums have different peak-to-loudness ratios (crest factors). A rock album
+at -8 LUFS typically has peaks at 0 dBFS (crest factor 8 dB). A classical
+album at -22 LUFS may also have peaks at -1 dBFS (crest factor 21 dB).
+
+To align both to -14 LUFS target:
+- Rock: gain -6 dB. Peaks drop to -6. No conflict.
+- Classical: gain +8 dB. Peaks would hit +7. Exceeds any ceiling.
+
+The naive solutions fail:
+- **Cap gain** (play quieter): classical plays 8 dB below target. Volume
+  drop between albums defeats the tape's purpose.
+- **Full gain + unlimited limiting**: 8 dB of peak limiting crushes
+  fortissimos. The dynamics that define classical music are destroyed.
+
+### The Solution: Limiting Budget
+
+A bounded amount of peak limiting (default 3 dB) is applied automatically.
+
+```
+TRANSPARENT_LIMITING_BUDGET_DB = 3.0
+
+desired_gain = target_LUFS - measured_LUFS
+max_safe_gain = peak_ceiling_dBTP - true_peak_dBTP
+
+if desired_gain <= max_safe_gain:
+    gain = desired_gain          # Target reached without limiting
+else:
+    gain = min(desired_gain, max_safe_gain + budget)
+    penalty = desired_gain - gain  # How far below target
 ```
 
 - In album mode: use album integrated LUFS and album max true peak
-- `headroom` is a positive value in dB (e.g., 1.0 means peak ceiling at -1 dBTP)
-- Accept that some content can't reach target without clipping — play it quieter rather than destroy dynamics, unless a limiter is explicitly part of the medium profile
+- `peak_ceiling_dBTP` defaults to -1 for hard-clip media (VHS/MD/CD),
+  0 for soft-clip media (cassette/reel)
+- The limiter catches `gain - max_safe_gain` dB of peaks (always ≤ budget)
+
+### Why 3 dB
+
+True peaks are transients — drum attacks, piano hammers, brass staccato.
+The ear integrates loudness over ~20-50 ms. A limiter with 5 ms attack and
+50 ms release shaving ≤3 dB catches content the auditory system doesn't
+resolve as "loud."
+
+At 3+ dB, sustained high-level content (organ pedal tones, brass fortissimo
+held notes) begins to be audibly affected. At 5+ dB, the "squashing" is
+obvious. At 8+ dB, dynamics are destroyed.
+
+3 dB is the boundary of transparent operation.
+
+### Behavior by Material
+
+| Material | LUFS | Peak | Desired | Gain | Penalty | Limiter |
+|----------|------|------|---------|------|---------|---------|
+| Loudness war rock | -8 | +0.5 | -6 dB | -6 dB | 0 | 0 |
+| Normal rock | -12 | -0.5 | -2 dB | -2 dB | 0 | 0 |
+| Dylan-era rock | -14 | -1.5 | 0 dB | 0 dB | 0 | 0 |
+| Jazz | -16 | -0.5 | +4 dB | +2.5 dB | 1.5 dB | 3 dB |
+| Orchestral | -18 | -0.5 | +4 dB | +2.5 dB | 1.5 dB | 3 dB |
+| Extreme classical | -22 | -1 | +8 dB | +3 dB | 5 dB | 3 dB |
+
+The majority of CD-ripped material (LUFS -6 to -14) needs zero limiting.
+Jazz and orchestral get ≤3 dB of transparent limiting. Only extreme
+classical on a loud rock tape produces a significant penalty — and the
+LUFS spread warning flags this as an incompatible combination.
+
+### The --limiter Flag
+
+With `--limiter`, the budget is unlimited. ALL albums reach exactly -14 LUFS
+regardless of how much limiting is needed. This is the user's explicit choice
+to prioritize volume consistency over dynamics.
+
+Use `--limiter` when:
+- Making a mixtape where volume consistency across tracks matters most
+- Recording background music where dynamic surprise is unwanted
+- The LUFS spread between albums is moderate (5-10 dB)
+
+Do NOT use `--limiter` when:
+- Recording a single classical album (defeats the mastering intent)
+- The LUFS spread exceeds 10 dB (incompatible material — separate tapes)
+
+### Interaction with Compressor
+
+The limiter and compressor solve different problems:
+
+| Concern | Tool | Driven by |
+|---------|------|-----------|
+| Peaks prevent reaching target LUFS | Limiter (budget) | Peak-to-loudness ratio |
+| Quiet passages below medium noise floor | Compressor | LRA vs medium DR |
+
+Signal chain: gain → compressor → limiter. The compressor may raise quiet
+passages (creating new peaks); the limiter is always last as the final
+safety net.
 
 ## Session Analysis
 
@@ -119,9 +324,11 @@ The compressor parameters are not static — they are computed from the album's 
 
 ### Future: Vinyl Cutting
 
+Basic vinyl-lp preset exists (duration/side constraints, two-sided rendering).
+Not yet implemented:
+
 - RIAA equalization
 - Groove velocity limits (bass mono summing considerations)
-- Side duration constraints
 
 ### Future: Broadcast
 
@@ -155,72 +362,77 @@ CREATE TABLE album_loudness (
     analyzed_at TEXT NOT NULL
 );
 
-CREATE TABLE medium_profile (
-    name TEXT PRIMARY KEY,          -- 'digital-14', 'vhs-hifi', 'cassette-c90'
-    target_lufs REAL NOT NULL,
-    peak_ceiling_dbtp REAL,         -- NULL for soft-ceiling media (tape)
-    dynamic_range_db REAL NOT NULL,
-    max_duration_sec REAL,          -- NULL for unlimited
-    lead_in_sec REAL NOT NULL DEFAULT 0,
-    lead_out_sec REAL NOT NULL DEFAULT 0,
-    inter_album_gap_sec REAL NOT NULL DEFAULT 3,
-    notes TEXT
-);
-
-CREATE TABLE session (
+CREATE TABLE tape_project (
     id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,             -- 'Friday VHS Mix', 'Metallica Marathon'
-    medium TEXT NOT NULL REFERENCES medium_profile(name),
+    name TEXT UNIQUE NOT NULL,
+    medium TEXT NOT NULL,            -- preset name (e.g. 'vhs-120', 'c-90')
+    duration_sec REAL NOT NULL,
+    lead_in_sec REAL NOT NULL DEFAULT 25,
+    lead_out_sec REAL NOT NULL DEFAULT 20,
+    album_gap_sec REAL NOT NULL DEFAULT 8,
+    track_gap_sec REAL NOT NULL DEFAULT 4,
+    marker TEXT NOT NULL DEFAULT 'none',
+    marker_freq REAL NOT NULL DEFAULT 400,
+    marker_level_dbfs REAL NOT NULL DEFAULT -30,
+    marker_duration_sec REAL NOT NULL DEFAULT 0.5,
+    target_lufs REAL NOT NULL DEFAULT -14,
+    peak_ceiling_dbtp REAL NOT NULL DEFAULT 0,
+    sample_rate TEXT NOT NULL DEFAULT 'auto',
+    bit_depth INTEGER NOT NULL DEFAULT 24,
+    use_limiter INTEGER NOT NULL DEFAULT 0,
+    use_compressor INTEGER NOT NULL DEFAULT 0,
+    side_a_duration_sec REAL,       -- NULL for single-sided
+    side_b_duration_sec REAL,       -- NULL for single-sided
     created_at TEXT NOT NULL
 );
 
-CREATE TABLE session_album (
-    session_id INTEGER NOT NULL REFERENCES session(id),
-    album_path TEXT NOT NULL REFERENCES album_loudness(path),
-    position INTEGER NOT NULL,      -- playback order
-    -- computed per session analysis:
-    computed_gain_db REAL,
-    needs_limiter INTEGER,          -- 0/1
-    needs_compressor INTEGER,       -- 0/1
-    compressor_params TEXT,         -- JSON: ratio, threshold, knee, attack, release
-    limiter_params TEXT,            -- JSON: limit, attack, release
-    warnings TEXT,                  -- compatibility warnings
-    PRIMARY KEY (session_id, position)
+CREATE TABLE tape_item (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES tape_project(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    item_type TEXT NOT NULL,         -- 'album' or 'track'
+    path TEXT NOT NULL,
+    side TEXT DEFAULT NULL,          -- 'a', 'b', or NULL (auto-assign)
+    UNIQUE(project_id, position)
 );
 ```
+
+Medium presets (duration, dynamic range, side count) are hardcoded in `constants.py`, not stored in the database. Computed fields (gain, limiter/compressor decisions) are calculated at runtime by the analysis engine and stored in `ItemAnalysis` dataclasses — they are not persisted in the DB.
 
 ### Incremental Scan
 
 `musiktool analyze` compares `file_mtime` in the DB against the file's current mtime. Only re-analyzes tracks whose files have changed. Album-level aggregates are recomputed when any constituent track is re-analyzed.
 
-## Session Workflow
+## Tape Workflow
 
 ```
 1. Analyze library (once, then incremental)
-   musiktool analyze ~/Music  →  ~/.local/share/musiktool/analytics.db
+   musiktool analyze ~/Music
 
-2. Create session
-   musiktool session create "Friday VHS" --medium vhs-hifi \
+2. Create project
+   musiktool tape create "Friday VHS" --medium vhs-120
+
+3. Add content
+   musiktool tape add "Friday VHS" \
      "~/Music/Metallica/Master Of Puppets (1986)" \
      "~/Music/Metallica/...And Justice For All (1988)" \
      "~/Music/Metallica/Metallica (1991)"
 
-3. Analyze session (compatibility check + gain computation)
-   musiktool session analyze "Friday VHS"
-   → reports: LUFS spread, LRA spread, duration fit, warnings
-   → computes: per-album gain, limiter/compressor decisions
-   → stores results in session_album table
+4. Analyze (compatibility check + gain computation)
+   musiktool tape analyze "Friday VHS"
+   → reports: LUFS spread, LRA range, duration fit, warnings
+   → computes: per-item gain, limiter/compressor decisions (runtime only, not persisted)
 
-4. Review & adjust
-   musiktool session show "Friday VHS"
-   → displays per-album chain with computed parameters
+5. Review & adjust
+   musiktool tape show "Friday VHS"
+   musiktool tape show "Friday VHS" --timeline
 
-5. Render / play
-   musiktool session render "Friday VHS" -o output.wav
-   musiktool session play "Friday VHS"
-   → builds ffmpeg filter chain per album
+6. Render
+   musiktool tape render "Friday VHS" -o ./output
+   → builds ffmpeg filter chain per item
    → inserts lead-in, inter-album gaps, lead-out
-   → outputs to file / PipeWire / device
+   → outputs FLAC + CUE + TXT to project directory
+   → two-sided media: per-side FLAC/CUE + combined TXT
 ```
 
 ## Architecture
@@ -228,28 +440,31 @@ CREATE TABLE session_album (
 ```
 musiktool analyze ~/Music  →  ~/.local/share/musiktool/analytics.db
                                       │
-           session definition ────────────┤
-           (albums + medium profile)      │
-                                          ▼
-                              session analyzer
-                    (compatibility check, gain/chain decisions)
-                                          │
-                                          ▼
-                              filter chain builder
-              (per-album: gain + limiter + compressor + medium-specific)
-                                          │
-                                          ▼
-              lead-in ─ album1 ─ gap ─ album2 ─ gap ─ album3 ─ lead-out
-                                          │
-                                          ▼
-              ffmpeg pipeline → output (PipeWire / file / tape deck)
+           tape project ──────────────┤
+           (items + medium preset)    │
+                                      ▼
+                          project analyzer
+                (compatibility check, gain/chain decisions)
+                                      │
+                                      ▼
+                          filter chain builder
+          (per-item: gain + limiter + compressor + medium-specific)
+                                      │
+                                      ▼
+          lead-in ─ item1 ─ gap ─ item2 ─ gap ─ item3 ─ lead-out
+                                      │
+                                      ▼
+          ffmpeg pipeline → FLAC + CUE + TXT (per side for two-sided)
 ```
 
-## Implementation Steps
+## Implementation Status
 
-1. ~~`musiktool analyze` — bulk EBU R128 scan → SQLite DB (incremental)~~ **done** (2026-05-03: 124 albums, 1851 tracks)
-2. Medium profiles — built-in defaults (digital, vhs-hifi, cassette, broadcast)
-3. Session management — create, list, show, delete sessions
-4. Session analyzer — compatibility assessment, gain computation, chain decisions
-5. Filter chain builder — translates decisions into ffmpeg filter graphs
-6. Renderer/player — assembles full output with gaps and padding
+All steps are complete as of 2026-05-03:
+
+1. ~~`musiktool analyze` — bulk EBU R128 scan → SQLite DB (incremental)~~ (124 albums, 1851 tracks)
+2. ~~Medium presets — VHS, cassette, vinyl hardcoded in `constants.py`~~
+3. ~~Tape project management — create, list, show, add, insert, remove, move, delete~~
+4. ~~Project analyzer — compatibility assessment, gain computation, limiter/compressor decisions~~
+5. ~~Segment builder — translates decisions into ffmpeg filter graphs~~
+6. ~~Renderer — assembles full output with gaps, markers, CUE + TXT indices~~
+7. ~~Two-sided media — cassette and vinyl with auto-split and side pinning~~

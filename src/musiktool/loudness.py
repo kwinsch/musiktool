@@ -2,7 +2,7 @@
 
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mutagen
@@ -68,13 +68,19 @@ def measure_album(
     Album-level integrated LUFS and LRA are measured from the concatenated stream.
     Album true peak is the max across all per-track true peaks.
     """
-    from musiktool.constants import AUDIO_EXTENSIONS
+    from musiktool.constants import collect_audio_files
 
+    directory_path = Path(directory).resolve()
     if tracks is None:
-        tracks = []
-        for p in sorted(Path(directory).iterdir()):
-            if p.suffix.lower() in AUDIO_EXTENSIONS:
-                tracks.append(measure_track(str(p)))
+        tracks = [
+            measure_track(str(p.resolve()))
+            for p in collect_audio_files(directory_path)
+        ]
+    else:
+        tracks = [
+            replace(t, path=str(Path(t.path).resolve()))
+            for t in tracks
+        ]
 
     if not tracks:
         return [], None
@@ -104,8 +110,19 @@ def measure_album(
         )
 
     output = result.stderr
-    album_lufs = _parse_summary_value(output, "I:")
-    album_lra = _parse_summary_value(output, "LRA:")
+    if result.returncode != 0:
+        raise AudioReadError(
+            f"ffmpeg album measurement failed for {directory_path}: "
+            f"{_stderr_tail(output)}"
+        )
+    try:
+        album_lufs = _parse_summary_value(output, "I:")
+        album_lra = _parse_summary_value(output, "LRA:")
+    except ValueError as e:
+        raise AudioReadError(
+            f"failed to parse album loudness for {directory_path}: {e}\n"
+            f"{_stderr_tail(output)}"
+        ) from e
 
     # Album true peak = max across all tracks
     album_peak = max(t.true_peak_dbtp for t in tracks)
@@ -116,10 +133,18 @@ def measure_album(
         true_peak_dbtp=album_peak,
         lra=album_lra,
         duration_sec=album_duration,
-        path=directory,
+        path=str(directory_path),
     )
 
     return tracks, album_info
+
+
+def _stderr_tail(output: str, *, max_lines: int = 20) -> str:
+    """Return a concise stderr tail for diagnostics."""
+    lines = output.strip().splitlines()
+    if not lines:
+        return "(no stderr)"
+    return "\n".join(lines[-max_lines:])
 
 
 def _parse_summary_value(output: str, key: str) -> float:

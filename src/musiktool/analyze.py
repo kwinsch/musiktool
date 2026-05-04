@@ -53,7 +53,8 @@ def analyze_album(
     album_path: Path, conn: sqlite3.Connection, *, force: bool = False,
 ) -> AlbumResult:
     """Analyze a single album directory. Measures only stale/new tracks."""
-    audio_files = collect_audio_files(album_path)
+    album_path = album_path.resolve()
+    audio_files = [p.resolve() for p in collect_audio_files(album_path)]
     album_str = str(album_path)
 
     if not audio_files:

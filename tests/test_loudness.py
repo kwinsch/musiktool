@@ -1,8 +1,12 @@
 """Tests for loudness parsing."""
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
-from musiktool.loudness import _parse_summary_value
+from musiktool.exceptions import AudioReadError
+from musiktool.loudness import LoudnessInfo, _parse_summary_value, measure_album
 
 
 SAMPLE_EBUR128_OUTPUT = """\
@@ -64,3 +68,68 @@ class TestParseSummaryValue:
         output = "Some output\nSummary:\n  Threshold: -24.1 LUFS\n"
         with pytest.raises(ValueError, match="failed to parse"):
             _parse_summary_value(output, "I:")
+
+
+class TestMeasureAlbum:
+
+    def test_concat_uses_absolute_paths(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        album = tmp_path / "album"
+        album.mkdir()
+        track = album / "01 It's.flac"
+        track.touch()
+        captured = {}
+
+        def fake_measure_track(path: str) -> LoudnessInfo:
+            assert Path(path).is_absolute()
+            return LoudnessInfo(
+                integrated_lufs=-14.0,
+                true_peak_dbtp=-1.0,
+                lra=6.0,
+                duration_sec=120.0,
+                path=path,
+            )
+
+        def fake_run(cmd, capture_output, text):
+            concat_path = Path(cmd[cmd.index("-i") + 1])
+            captured["concat"] = concat_path.read_text()
+            return subprocess.CompletedProcess(
+                cmd, 0, stderr=SAMPLE_EBUR128_OUTPUT,
+            )
+
+        monkeypatch.setattr(
+            "musiktool.loudness.measure_track", fake_measure_track,
+        )
+        monkeypatch.setattr("musiktool.loudness.subprocess.run", fake_run)
+        monkeypatch.chdir(tmp_path)
+
+        tracks, album_info = measure_album("album")
+
+        escaped = str(track.resolve()).replace("'", "'\\''")
+        assert captured["concat"] == f"file '{escaped}'\n"
+        assert tracks[0].path == str(track.resolve())
+        assert album_info is not None
+        assert album_info.path == str(album.resolve())
+
+    def test_parse_failure_raises_audio_read_error(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        track = tmp_path / "01 Track.flac"
+        tracks = [
+            LoudnessInfo(
+                integrated_lufs=-14.0,
+                true_peak_dbtp=-1.0,
+                lra=6.0,
+                duration_sec=120.0,
+                path=str(track),
+            )
+        ]
+
+        def fake_run(cmd, capture_output, text):
+            return subprocess.CompletedProcess(cmd, 0, stderr="no summary")
+
+        monkeypatch.setattr("musiktool.loudness.subprocess.run", fake_run)
+
+        with pytest.raises(AudioReadError, match="failed to parse album loudness"):
+            measure_album(str(tmp_path), tracks=tracks)

@@ -3,16 +3,19 @@
 import pytest
 
 from musiktool.tape import (
+    AnalysisResult,
     SideItem,
     _compute_compressor_params,
     _compute_gain,
     _compute_gain_with_limiter,
+    _capacity_status,
     _format_cue_time,
     _format_deck_time,
     _resolve_sample_rate,
     assign_sides,
     compute_gap,
     find_best_split,
+    format_analysis,
     format_duration,
 )
 
@@ -48,20 +51,21 @@ class TestComputeGain:
 
     def test_peak_limited_gain(self):
         # -20 LUFS, target -14 → wants +6 dB
-        # But peak at -2 dBTP, ceiling 0 → max safe gain is +2 dB
+        # Peak at -2 dBTP, ceiling 0 → max safe gain is +2 dB
+        # Budget 3: gain = min(6, 2+3) = 5, penalty = 1
         gain, peak, limiter, penalty = _compute_gain(-20.0, -2.0, -14.0, 0.0)
-        assert gain == pytest.approx(2.0)
-        assert peak == pytest.approx(0.0)
+        assert gain == pytest.approx(5.0)
+        assert peak == pytest.approx(3.0)
         assert limiter is True
-        assert penalty == pytest.approx(4.0)  # 6 - 2 = 4 dB penalty
+        assert penalty == pytest.approx(1.0)
 
-    def test_peak_at_zero_no_gain_possible(self):
-        # Peak already at 0 dBTP, ceiling 0 → no gain allowed
+    def test_peak_at_zero_budget_limited(self):
+        # Peak at 0 dBTP, ceiling 0 → max safe = 0. Budget 3: gain = min(6, 3) = 3
         gain, peak, limiter, penalty = _compute_gain(-20.0, 0.0, -14.0, 0.0)
-        assert gain == pytest.approx(0.0)
-        assert peak == pytest.approx(0.0)
+        assert gain == pytest.approx(3.0)
+        assert peak == pytest.approx(3.0)
         assert limiter is True
-        assert penalty == pytest.approx(6.0)
+        assert penalty == pytest.approx(3.0)
 
     def test_negative_peak_ceiling(self):
         # Ceiling at -1 dBTP (headroom for DAC intersample peaks)
@@ -72,21 +76,41 @@ class TestComputeGain:
 
     def test_negative_ceiling_triggers_limiter(self):
         # -20 LUFS, target -14, peak -2, ceiling -1
-        # Desired = +6, max safe = -1 - (-2) = +1
+        # Desired = +6, max safe = -1 - (-2) = +1. Budget 3: gain = min(6, 1+3) = 4
         gain, peak, limiter, penalty = _compute_gain(-20.0, -2.0, -14.0, -1.0)
-        assert gain == pytest.approx(1.0)
-        assert peak == pytest.approx(-1.0)
+        assert gain == pytest.approx(4.0)
+        assert peak == pytest.approx(2.0)
         assert limiter is True
-        assert penalty == pytest.approx(5.0)
+        assert penalty == pytest.approx(2.0)
 
     def test_very_quiet_classical(self):
         # Classical album at -25 LUFS, peak -8, target -14
-        # Desired = +11, max safe = 0 - (-8) = +8
+        # Desired = +11, max safe = 0 - (-8) = +8. Budget 3: gain = min(11, 8+3) = 11
+        # Budget is sufficient — album reaches target!
         gain, peak, limiter, penalty = _compute_gain(-25.0, -8.0, -14.0, 0.0)
-        assert gain == pytest.approx(8.0)
-        assert peak == pytest.approx(0.0)
+        assert gain == pytest.approx(11.0)
+        assert peak == pytest.approx(3.0)
         assert limiter is True
-        assert penalty == pytest.approx(3.0)
+        assert penalty == pytest.approx(0.0)
+
+    def test_cd_rock_to_hard_clip_medium_transparent(self):
+        # Loud CD rock (-8 LUFS, peak +0.5 dBTP) → VHS/MD ceiling -1 dBTP
+        # desired = -6, max_safe = -1 - 0.5 = -1.5
+        # -6 ≤ -1.5 → gain = -6 (attenuation), no limiter
+        gain, peak, limiter, penalty = _compute_gain(-8.0, 0.5, -14.0, -1.0)
+        assert gain == pytest.approx(-6.0)
+        assert peak == pytest.approx(-5.5)
+        assert limiter is False
+        assert penalty == pytest.approx(0.0)
+
+    def test_cd_classical_to_hard_clip_needs_limiter(self):
+        # Quiet classical (-22 LUFS, peak -1 dBTP) → ceiling -1 dBTP
+        # desired = +8, max_safe = -1 - (-1) = 0. Budget 3: gain = min(8, 0+3) = 3
+        gain, peak, limiter, penalty = _compute_gain(-22.0, -1.0, -14.0, -1.0)
+        assert gain == pytest.approx(3.0)
+        assert peak == pytest.approx(2.0)
+        assert limiter is True
+        assert penalty == pytest.approx(5.0)
 
 
 # --- format_duration ---
@@ -260,17 +284,78 @@ class TestComputeGainWithLimiter:
         assert limiter is True
         assert penalty == pytest.approx(0.0)
 
-    def test_limiter_off_preserves_penalty(self):
+    def test_limiter_off_uses_budget(self):
+        # Without --limiter: budget=3. desired=6, max_safe=2, gain=min(6,5)=5
         gain, peak, limiter, penalty = _compute_gain_with_limiter(
             -20.0, -2.0, -14.0, 0.0, use_limiter=False,
         )
-        assert gain == pytest.approx(2.0)
-        assert penalty == pytest.approx(4.0)
+        assert gain == pytest.approx(5.0)
+        assert penalty == pytest.approx(1.0)
 
     def test_limiter_default_is_off(self):
         result = _compute_gain_with_limiter(-20.0, -2.0, -14.0, 0.0)
         expected = _compute_gain(-20.0, -2.0, -14.0, 0.0)
         assert result == expected
+
+
+# --- Limiting budget ---
+
+
+class TestLimitingBudget:
+    """Explicit tests for the limiting_budget_db parameter."""
+
+    def test_budget_zero_pure_cap(self):
+        # Budget 0 = gain capped at max_safe (no limiting at all)
+        gain, peak, lim, pen = _compute_gain(-20.0, -2.0, -14.0, 0.0, limiting_budget_db=0.0)
+        assert gain == pytest.approx(2.0)
+        assert peak == pytest.approx(0.0)
+        assert lim is False
+        assert pen == pytest.approx(4.0)
+
+    def test_budget_infinite_full_gain(self):
+        # Budget inf = full desired gain regardless of peaks
+        gain, peak, lim, pen = _compute_gain(-20.0, -2.0, -14.0, 0.0, limiting_budget_db=float("inf"))
+        assert gain == pytest.approx(6.0)
+        assert peak == pytest.approx(4.0)
+        assert lim is True
+        assert pen == pytest.approx(0.0)
+
+    def test_budget_3_intermediate(self):
+        # desired=6, max_safe=2, budget=3 → gain=min(6, 2+3)=5, penalty=1
+        gain, peak, lim, pen = _compute_gain(-20.0, -2.0, -14.0, 0.0, limiting_budget_db=3.0)
+        assert gain == pytest.approx(5.0)
+        assert peak == pytest.approx(3.0)
+        assert lim is True
+        assert pen == pytest.approx(1.0)
+
+    def test_budget_sufficient_reaches_target(self):
+        # desired=3, max_safe=1, budget=3 → gain=min(3, 1+3)=3, penalty=0
+        gain, peak, lim, pen = _compute_gain(-17.0, -2.0, -14.0, -1.0, limiting_budget_db=3.0)
+        assert gain == pytest.approx(3.0)
+        assert peak == pytest.approx(1.0)
+        assert lim is True
+        assert pen == pytest.approx(0.0)
+
+    def test_no_limiting_needed_budget_irrelevant(self):
+        # Attenuation case: desired=-6, max_safe=-1.5. desired ≤ max_safe → no limiting.
+        gain, peak, lim, pen = _compute_gain(-8.0, 0.5, -14.0, -1.0, limiting_budget_db=3.0)
+        assert gain == pytest.approx(-6.0)
+        assert lim is False
+        assert pen == pytest.approx(0.0)
+
+    def test_budget_exactly_covers_excess(self):
+        # desired=5, max_safe=2, budget=3 → gain=min(5, 2+3)=5, penalty=0
+        gain, peak, lim, pen = _compute_gain(-19.0, -2.0, -14.0, 0.0, limiting_budget_db=3.0)
+        assert gain == pytest.approx(5.0)
+        assert pen == pytest.approx(0.0)
+        assert lim is True
+
+    def test_budget_1_small(self):
+        # Restrictive budget: desired=6, max_safe=2, budget=1 → gain=3, penalty=3
+        gain, peak, lim, pen = _compute_gain(-20.0, -2.0, -14.0, 0.0, limiting_budget_db=1.0)
+        assert gain == pytest.approx(3.0)
+        assert pen == pytest.approx(3.0)
+        assert lim is True
 
 
 # --- _compute_compressor_params ---
@@ -279,14 +364,16 @@ class TestComputeGainWithLimiter:
 class TestComputeCompressorParams:
 
     def test_lra_within_range_no_compression(self):
-        assert _compute_compressor_params(15.0, 80) is None
+        # VHS 90 dB → threshold = 90 * 0.25 = 22.5 LU
+        assert _compute_compressor_params(15.0, 90) is None
 
     def test_lra_at_threshold_no_compression(self):
-        # Threshold for 80 dB medium: min(80 * 0.25, 20) = 20 LU
-        assert _compute_compressor_params(20.0, 80) is None
+        # VHS 90 dB → threshold = 22.5 LU
+        assert _compute_compressor_params(22.5, 90) is None
 
     def test_lra_above_threshold_returns_params(self):
-        params = _compute_compressor_params(25.0, 80)
+        # VHS 90 dB → threshold = 22.5, LRA 25 exceeds
+        params = _compute_compressor_params(25.0, 90)
         assert params is not None
         assert params["ratio"] > 1.0
         assert params["threshold"] < 1.0
@@ -295,23 +382,146 @@ class TestComputeCompressorParams:
         assert params["knee"] == 2.83
 
     def test_higher_lra_higher_ratio(self):
-        p1 = _compute_compressor_params(22.0, 80)
-        p2 = _compute_compressor_params(30.0, 80)
+        p1 = _compute_compressor_params(24.0, 90)
+        p2 = _compute_compressor_params(30.0, 90)
         assert p2["ratio"] > p1["ratio"]
 
     def test_ratio_capped_at_3(self):
-        params = _compute_compressor_params(50.0, 80)
+        params = _compute_compressor_params(50.0, 90)
         assert params["ratio"] == 3.0
 
     def test_threshold_db_capped_at_minus_40(self):
-        params = _compute_compressor_params(50.0, 80)
+        params = _compute_compressor_params(50.0, 90)
         assert params["threshold_db"] == -40.0
 
     def test_small_medium_dynamic_range(self):
-        # Cassette ~55 dB → threshold = min(55 * 0.25, 20) = 13.75 LU
+        # Cassette ~55 dB → threshold = 55 * 0.25 = 13.75 LU
         assert _compute_compressor_params(13.0, 55) is None
         params = _compute_compressor_params(15.0, 55)
         assert params is not None
+
+    def test_type_i_bare_triggers_at_lra_15(self):
+        # Type I ferric (57 dB) → threshold = 57 * 0.25 = 14.25 LU
+        assert _compute_compressor_params(14.0, 57) is None
+        params = _compute_compressor_params(15.0, 57)
+        assert params is not None
+
+    def test_metal_dolbyc_no_compression_at_lra_22(self):
+        # Type IV + Dolby C (94 dB) → threshold = 94 * 0.25 = 23.5 LU
+        assert _compute_compressor_params(23.0, 94) is None
+
+    def test_open_reel_dolbysr_no_compression_at_lra_21(self):
+        # Reel + Dolby SR (88 dB) → threshold = 88 * 0.25 = 22.0 LU
+        assert _compute_compressor_params(21.0, 88) is None
+
+    def test_minidisc_no_compression_at_lra_23(self):
+        # MiniDisc (93 dB) → threshold = 93 * 0.25 = 23.25 LU
+        assert _compute_compressor_params(23.0, 93) is None
+
+    def test_threshold_scales_with_dr(self):
+        # No fixed cap — higher DR = higher threshold
+        # 80 dB: threshold 20, 96 dB: threshold 24
+        assert _compute_compressor_params(21.0, 80) is not None   # 21 > 20
+        assert _compute_compressor_params(21.0, 96) is None       # 21 < 24
+
+    def test_vhs_does_not_compress_cd_source(self):
+        # Wagner: LRA 22.1 from CD. VHS 90 dB → threshold 22.5.
+        # CD source should not need compression on VHS Hi-Fi.
+        assert _compute_compressor_params(22.1, 90) is None
+
+    def test_cd_equivalent_never_compresses_cd_source(self):
+        # CD dynamic range ~96 dB → threshold 24. Wagner LRA 22.1 passes.
+        assert _compute_compressor_params(22.1, 96) is None
+
+
+# --- CD transparency invariant ---
+
+
+class TestCdTransparencyInvariant:
+    """CD source → CD-class medium must be near-transparent.
+
+    The library is EAC-ripped Red Book. When targeting a medium with
+    comparable dynamic range (CD 96 dB, VHS 90 dB, MD 93 dB), the
+    pipeline should only apply gain — no compression, no limiting
+    for typical loud masters.
+    """
+
+    def test_loud_rock_no_limiter(self):
+        # Metallica Black Album style: -8 LUFS, peak +0.5 dBTP
+        # Target -14 → gain -6 dB, peak drops to -5.5. No limiter.
+        gain, peak, limiter, penalty = _compute_gain(-8.0, 0.5, -14.0, -1.0)
+        assert gain == pytest.approx(-6.0)
+        assert peak == pytest.approx(-5.5)
+        assert limiter is False
+        assert penalty == pytest.approx(0.0)
+
+    def test_moderate_rock_no_limiter(self):
+        # Dylan Blood on the Tracks style: -14 LUFS, peak -1.5 dBTP
+        # Target -14 → gain 0 dB. Peak stays at -1.5 (below ceiling). No limiter.
+        gain, peak, limiter, penalty = _compute_gain(-14.0, -1.5, -14.0, -1.0)
+        assert gain == pytest.approx(0.0)
+        assert peak == pytest.approx(-1.5)
+        assert limiter is False
+        assert penalty == pytest.approx(0.0)
+
+    def test_loudness_war_master_no_limiter(self):
+        # Extreme loudness war: -6 LUFS, peak +1.2 dBTP (intersample)
+        # Target -14 → gain -8 dB, peak drops to -6.8. No limiter.
+        gain, peak, limiter, penalty = _compute_gain(-6.0, 1.2, -14.0, -1.0)
+        assert gain == pytest.approx(-8.0)
+        assert peak == pytest.approx(-6.8)
+        assert limiter is False
+        assert penalty == pytest.approx(0.0)
+
+    def test_cd_medium_never_compresses_pop_rock(self):
+        # Pop/rock LRA range: 4-12 LU. CD medium 96 dB → threshold 24 LU.
+        for lra in (4.0, 6.0, 8.0, 10.0, 12.0):
+            assert _compute_compressor_params(lra, 96) is None
+
+    def test_cd_medium_never_compresses_jazz(self):
+        # Jazz LRA: 10-16 LU. Still well below 24 LU threshold.
+        for lra in (10.0, 12.0, 14.0, 16.0):
+            assert _compute_compressor_params(lra, 96) is None
+
+    def test_cd_medium_never_compresses_classical(self):
+        # Classical LRA: 15-23 LU. All below 24 LU threshold.
+        for lra in (15.0, 18.0, 20.0, 22.0, 23.0):
+            assert _compute_compressor_params(lra, 96) is None
+
+    def test_vhs_never_compresses_pop_rock(self):
+        # VHS 90 dB → threshold 22.5 LU. Pop/rock never exceeds.
+        for lra in (4.0, 6.0, 8.0, 10.0, 12.0):
+            assert _compute_compressor_params(lra, 90) is None
+
+    def test_md_never_compresses_pop_rock(self):
+        # MD 93 dB → threshold 23.25 LU. Pop/rock never exceeds.
+        for lra in (4.0, 6.0, 8.0, 10.0, 12.0):
+            assert _compute_compressor_params(lra, 93) is None
+
+    def test_quiet_classical_budget_limits_gain(self):
+        # Quiet classical (-22 LUFS, peak -1) → ceiling -1 dBTP
+        # Without --limiter: budget=3. desired=+8, max_safe=0, gain=min(8,3)=+3
+        # Album plays at -19 LUFS (5 dB below target), 3 dB transparent limiting.
+        gain, peak, limiter, penalty = _compute_gain_with_limiter(
+            -22.0, -1.0, -14.0, -1.0, use_limiter=False,
+        )
+        assert gain == pytest.approx(3.0)
+        assert peak == pytest.approx(2.0)
+        assert limiter is True
+        assert penalty == pytest.approx(5.0)
+        # No compression — dynamics preserved (just 3 dB of peak shaving)
+        assert _compute_compressor_params(20.0, 96) is None
+
+    def test_quiet_classical_full_alignment_with_user_limiter(self):
+        # Same album WITH --limiter: user chose volume over dynamics.
+        # Full +8 dB gain, limiter catches 8 dB of peaks above -1 dBTP.
+        gain, peak, limiter, penalty = _compute_gain_with_limiter(
+            -22.0, -1.0, -14.0, -1.0, use_limiter=True,
+        )
+        assert gain == pytest.approx(8.0)
+        assert peak == pytest.approx(7.0)
+        assert limiter is True
+        assert penalty == pytest.approx(0.0)
 
 
 # --- find_best_split ---
@@ -444,6 +654,71 @@ class TestAssignSides:
         assert sides[1] == "a"
         assert sides[2] == "b"
 
+    def test_pinned_preserves_position_order(self):
+        # Items: [1 auto, 2 pinned_a, 3 auto]. All fit on A.
+        # Must play in position order: 1, 2, 3 — not 2, 1, 3.
+        items = [
+            self._item(1, 600),
+            self._item(2, 600, pinned="a"),
+            self._item(3, 600),
+        ]
+        result = assign_sides(items, 2700, 2700, **self._DEFAULTS)
+        a_positions = [r.position for r in result if r.side == "a"]
+        assert a_positions == [1, 2, 3]
+
+    def test_pinned_b_preserves_order(self):
+        # Items: [1 pinned_b, 2 auto→B, 3 pinned_b]. Must be 1, 2, 3 on B.
+        items = [
+            self._item(1, 600, pinned="b"),
+            self._item(2, 5000),  # too big for A → goes to B
+            self._item(3, 600, pinned="b"),
+        ]
+        result = assign_sides(items, 100, 2700, **self._DEFAULTS)
+        b_positions = [r.position for r in result if r.side == "b"]
+        assert b_positions == [1, 2, 3]
+
+    def test_pinned_order_capacity_uses_final_gap_sequence(self):
+        # Old bug: pinned A was accounted before auto items, so the algorithm
+        # counted album→track then track→track gaps instead of final playback
+        # order track→album→track. That let item 3 overfill side A.
+        items = [
+            self._item(1, 50, item_type="track"),
+            self._item(2, 50, item_type="album", pinned="a"),
+            self._item(3, 50, item_type="track"),
+        ]
+        result = assign_sides(items, 207, 2700, **self._DEFAULTS)
+        sides = {r.position: r.side for r in result}
+        assert sides[1] == "a"
+        assert sides[2] == "a"
+        assert sides[3] == "b"
+
+    def test_future_pinned_reservation_prevents_auto_overfill(self):
+        # Item 1 fits on an empty side A, but not once the future pinned item
+        # is reserved in its final playback position.
+        items = [
+            self._item(1, 600),
+            self._item(2, 600, pinned="a"),
+        ]
+        result = assign_sides(items, 1000, 2700, **self._DEFAULTS)
+        sides = {r.position: r.side for r in result}
+        assert sides[1] == "b"
+        assert sides[2] == "a"
+
+    def test_split_album_accounts_for_future_pinned_item(self):
+        # Full album + pinned item is over side A. The largest prefix that
+        # fits with the pinned item in final order is two tracks.
+        items = [
+            self._item(1, 150, tracks=[50.0, 50.0, 50.0]),
+            self._item(2, 50, pinned="a"),
+        ]
+        result = assign_sides(items, 203, 2700, **self._DEFAULTS)
+        prefix = next(r for r in result if r.position == 1 and r.side == "a")
+        suffix = next(r for r in result if r.position == 1 and r.side == "b")
+        assert prefix.track_range == (0, 2)
+        assert prefix.duration_sec == pytest.approx(100.0)
+        assert suffix.track_range == (2, 3)
+        assert suffix.duration_sec == pytest.approx(50.0)
+
     def test_pinned_exceeds_capacity(self):
         # Pinned item larger than side → still assigned (warning elsewhere)
         items = [self._item(1, 5000, pinned="a")]
@@ -484,3 +759,65 @@ class TestAssignSides:
         assert result[0].side == "a"
         assert result[1].side == "a"
         assert result[2].side == "b"
+
+
+# --- format_analysis ---
+
+
+class TestFormatAnalysis:
+
+    def test_two_sided_duration_summary_is_side_aware(self):
+        result = AnalysisResult(
+            project_name="Test",
+            medium="c-90",
+            target_lufs=-14.0,
+            source_rates={44100: 1},
+            resolved_rate=44100,
+            items=[],
+            lufs_spread=0.0,
+            lra_min=0.0,
+            lra_max=0.0,
+            duration_total_sec=111.0,
+            duration_capacity_sec=120.0,
+            warnings=["Side A: over"],
+            side_durations=[("A", 121.0, 60.0), ("B", 50.0, 60.0)],
+        )
+
+        out = format_analysis(result)
+
+        assert (
+            "Duration:     Side A 2:01 / 1:00 (OVER); "
+            "Side B 0:50 / 1:00 (fits)"
+        ) in out
+
+    def test_capacity_summary_uses_nominal_grace_before_over(self):
+        result = AnalysisResult(
+            project_name="Test",
+            medium="vhs-120",
+            target_lufs=-14.0,
+            source_rates={44100: 1},
+            resolved_rate=44100,
+            items=[],
+            lufs_spread=0.0,
+            lra_min=0.0,
+            lra_max=0.0,
+            duration_total_sec=92.0,
+            duration_capacity_sec=60.0,
+        )
+
+        out = format_analysis(result)
+
+        assert "Duration:     1:32 / 1:00 (grace)" in out
+        assert "No issues found." in out
+
+
+class TestCapacityStatus:
+
+    def test_under_capacity_fits(self):
+        assert _capacity_status(59.0, 60.0) == "fits"
+
+    def test_over_capacity_within_grace(self):
+        assert _capacity_status(90.0, 60.0) == "grace"
+
+    def test_over_capacity_past_grace(self):
+        assert _capacity_status(121.0, 60.0) == "OVER"

@@ -147,7 +147,7 @@ def loudness(
 @app.command()
 def analyze(
     path: Path = typer.Argument(..., help="Library root or album directory to analyze"),
-    db_path: Path = typer.Option(None, "--db", help="Database path (default: analytics.db next to lib/)"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
     force: bool = typer.Option(False, "--force", "-f", help="Re-analyze all tracks regardless of mtime"),
 ):
     """Bulk EBU R128 analysis into analytics DB (incremental)."""
@@ -288,7 +288,7 @@ def _tape_conn():
 @tape_app.command("create")
 def tape_create(
     name: str = typer.Argument(..., help="Project name"),
-    medium: str = typer.Option(..., "--medium", "-m", help="Medium preset: vhs-120, vhs-160, vhs-180, or custom"),
+    medium: str = typer.Option(..., "--medium", "-m", help="Medium preset (e.g. vhs-120, c-90-ii-dolbyb, reel-10-half-15ips, md-80, cd-80, vinyl-lp, custom)"),
     duration: float = typer.Option(None, "--duration", help="Usable duration in minutes (required for custom)"),
     lead_in: float = typer.Option(25, "--lead-in", help="Lead-in silence in seconds"),
     lead_out: float = typer.Option(20, "--lead-out", help="Lead-out silence in seconds"),
@@ -299,7 +299,7 @@ def tape_create(
     marker_level: float = typer.Option(-30, "--marker-level", help="Marker tone level in dBFS"),
     marker_duration: float = typer.Option(0.5, "--marker-duration", help="Marker tone duration in seconds"),
     target_lufs: float = typer.Option(-14, "--target-lufs", help="Target integrated loudness in LUFS"),
-    peak_ceiling: float = typer.Option(0, "--peak-ceiling", help="Peak ceiling in dBTP (0=full scale, -1=1dB headroom)"),
+    peak_ceiling: float = typer.Option(None, "--peak-ceiling", help="Peak ceiling in dBTP (default: -1 for VHS/MD, 0 for tape)"),
     sample_rate: str = typer.Option("auto", "--sample-rate", help="Output sample rate (auto or Hz value)"),
     bit_depth: int = typer.Option(24, "--bit-depth", help="Output bit depth: 16 or 24"),
     limiter: bool = typer.Option(False, "--limiter", help="Enable peak limiter for items that would clip"),
@@ -331,6 +331,12 @@ def tape_create(
         project = tape.get_project(conn, name)
         capacity = tape.format_duration(project["duration_sec"])
         typer.echo(f"Created \"{name}\" ({medium}, {capacity} usable)")
+        if medium.startswith("vinyl"):
+            typer.echo(
+                "  Warning: vinyl mastering constraints (bass mono, de-essing, "
+                "HF rolloff) are not yet implemented. This preset is for "
+                "duration/side planning only."
+            )
     finally:
         conn.close()
 
@@ -741,13 +747,13 @@ def _collect_audio_files(path: Path) -> list[Path]:
 
 
 @app.callback()
-def main() -> None:
-    """Global error handler for friendly MusiktoolError output."""
-    # Typer will call this before subcommands; we wrap execution below
+def cli_root() -> None:
+    """Root command callback."""
     pass
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point with friendly musiktool errors."""
     import sys
 
     try:
@@ -755,8 +761,7 @@ if __name__ == "__main__":
     except MusiktoolError as e:
         typer.secho(f"Error: {e}", err=True)
         sys.exit(1)
-    except typer.Exit:
-        raise
-    except Exception:
-        # Let other exceptions (including Click/Typer internal) behave normally
-        raise
+
+
+if __name__ == "__main__":
+    main()
