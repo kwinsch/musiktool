@@ -33,6 +33,7 @@ Two-sided media (cassette, vinyl, some VHS) are fully supported, including autom
 - `analyze` – incremental EBU R128 measurement of a library or single album (mtime-based, stores results in `analytics.db`).
 - `loudness` – quick per-track or per-album measurement.
 - `tags` – inspect current tags.
+- `audit` / `inspect` / `apply` – agent-facing JSON/NDJSON library audit and validated fix plans.
 
 ### Tape Mastering (`musiktool tape`)
 - Create projects for VHS, cassette, or custom lengths.
@@ -45,12 +46,14 @@ Two-sided media (cassette, vinyl, some VHS) are fully supported, including autom
 - `calibrate` – generate 1 kHz reference tones at multiple levels for setting deck VU meters.
 - `--rates` mode produces sample-rate test files.
 
-See `docs/tape-cli.md` for the complete command reference (pseudo-manpage style).
+See `docs/tape-cli.md` for the tape command reference and
+`docs/library-cli.md` for the agent-assisted library maintenance commands
+(pseudo-manpage style).
 
 ## Planned Expansions (Library Side)
 
 - Better handling of multi-disc albums and compilations.
-- Automatic detection and fixing of common tagging problems.
+- More automatic suggestions for common tagging problems.
 - Integration with existing ReplayGain scanners (read-only, for comparison).
 - Support for more output formats (WAV, Opus, etc.) in the tape renderer.
 - A simple TUI or web view for managing large tape projects.

@@ -276,6 +276,68 @@ def tags(
         typer.echo("")
 
 
+@app.command()
+def audit(
+    path: Path = typer.Argument(..., help="Library root, staging source, album directory, or track file"),
+    against: Path = typer.Option(None, "--against", help="Curated library root to compare against"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    severity: str = typer.Option("info", "--severity", help="Minimum severity: info, warning, or error"),
+    include_ok: bool = typer.Option(False, "--include-ok", help="Include successful checks in JSON output"),
+) -> None:
+    """Audit a music library or staging source without modifying files."""
+    from musiktool.library import audit_library, format_audit
+
+    result = audit_library(
+        path,
+        against=against,
+        min_severity=severity,
+        include_ok=include_ok,
+    )
+    typer.echo(format_audit(result, output_format), nl=False)
+
+
+@app.command()
+def inspect(
+    path: Path = typer.Argument(..., help="Album directory, staging directory, or track file"),
+    against: Path = typer.Option(None, "--against", help="Curated library root to compare against"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    severity: str = typer.Option("info", "--severity", help="Minimum severity: info, warning, or error"),
+) -> None:
+    """Inspect one path and return detailed evidence for agent review."""
+    from musiktool.library import format_inspect, inspect_path
+
+    result = inspect_path(path, against=against, min_severity=severity)
+    typer.echo(format_inspect(result, output_format), nl=False)
+
+
+@app.command("apply")
+def apply_cmd(
+    plan: Path = typer.Argument(..., help="Fix plan JSON path, or '-' for stdin"),
+    dry_run: bool = typer.Option(True, "--dry-run/--execute", help="Validate only, or apply changes"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    quarantine_dir: Path = typer.Option(None, "--quarantine-dir", help="Destination for quarantine actions"),
+) -> None:
+    """Validate and optionally execute a whitelisted library fix plan."""
+    import sys
+
+    from musiktool.library import apply_plan, format_apply
+
+    if str(plan) == "-":
+        result = apply_plan(
+            "-",
+            plan_text=sys.stdin.read(),
+            dry_run=dry_run,
+            quarantine_dir=quarantine_dir,
+        )
+    else:
+        result = apply_plan(
+            plan,
+            dry_run=dry_run,
+            quarantine_dir=quarantine_dir,
+        )
+    typer.echo(format_apply(result, output_format), nl=False)
+
+
 # --- Tape subcommands ---
 
 

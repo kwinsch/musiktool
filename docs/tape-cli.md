@@ -842,6 +842,8 @@ All rendered output goes to the directory you pass to `-o` / `--output`:
 
 ## SEE ALSO
 
+- `musiktool-library(1)` — agent-assisted library audit and fix plans
 - `musiktool-analyze(1)` — bulk EBU R128 analysis
 - `musiktool-loudness(1)` — single track/album loudness measurement
+- `docs/library-cli.md` — library-maintenance command reference
 - `docs/playback-normalization.md` — design document for gain calculation and filter chains
