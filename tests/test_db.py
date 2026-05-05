@@ -135,3 +135,82 @@ def test_hard_clip_peak_ceiling_migration_is_idempotent(
         assert row["peak_ceiling_dbtp"] == -1.0
     finally:
         conn.close()
+
+
+def test_effective_library_classification_inherits_nearest_manual_parent(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    show = root / "radio" / "Show"
+    season = show / "Season"
+    track = season / "001 Episode.mp3"
+    conn = db.get_connection(tmp_path / "analytics.db")
+    try:
+        db.upsert_library_classification(
+            conn,
+            subject_path=str(track.resolve()),
+            media_kind="music",
+            source="default",
+            confidence=0.5,
+            confirmed_at=None,
+        )
+        db.upsert_library_classification(
+            conn,
+            subject_path=str(show.resolve()),
+            media_kind="radio",
+            source="manual",
+            confidence=1.0,
+            confirmed_at="2026-05-05T00:00:00+00:00",
+        )
+        db.upsert_library_classification(
+            conn,
+            subject_path=str(root.resolve()),
+            media_kind="music",
+            source="manual",
+            confidence=1.0,
+            confirmed_at="2026-05-05T00:00:00+00:00",
+        )
+        conn.commit()
+
+        row = db.get_effective_library_classification(conn, str(track.resolve()))
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert row["subject_path"] == str(show.resolve())
+    assert row["media_kind"] == "radio"
+
+
+def test_effective_library_classification_child_manual_overrides_parent(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lib"
+    show = root / "radio" / "Show"
+    track = show / "001 Episode.mp3"
+    conn = db.get_connection(tmp_path / "analytics.db")
+    try:
+        db.upsert_library_classification(
+            conn,
+            subject_path=str(show.resolve()),
+            media_kind="radio",
+            source="manual",
+            confidence=1.0,
+            confirmed_at="2026-05-05T00:00:00+00:00",
+        )
+        db.upsert_library_classification(
+            conn,
+            subject_path=str(track.resolve()),
+            media_kind="podcast",
+            source="manual",
+            confidence=1.0,
+            confirmed_at="2026-05-05T00:00:00+00:00",
+        )
+        conn.commit()
+
+        row = db.get_effective_library_classification(conn, str(track.resolve()))
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert row["subject_path"] == str(track.resolve())
+    assert row["media_kind"] == "podcast"

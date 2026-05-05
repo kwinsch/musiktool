@@ -30,13 +30,22 @@ class TrackInfo:
 
 
 def fingerprint(path: str) -> tuple[int, str]:
-    """Run fpcalc and return (duration, fingerprint)."""
+    """Run fpcalc and return (duration, fingerprint).
+
+    fpcalc may exit non-zero while still producing valid output
+    (e.g. partial decode errors).  Accept the result if stdout
+    contains the expected JSON fields.
+    """
     result = subprocess.run(
         ["fpcalc", "-json", path],
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    if not result.stdout.strip():
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, result.stdout, result.stderr,
+        )
     data = json.loads(result.stdout)
     return data["duration"], data["fingerprint"]
 

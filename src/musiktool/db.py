@@ -65,6 +65,60 @@ CREATE TABLE IF NOT EXISTS tape_item (
     side TEXT DEFAULT NULL,
     UNIQUE(project_id, position)
 );
+
+CREATE TABLE IF NOT EXISTS indexed_files (
+    path TEXT PRIMARY KEY,
+    root TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    ctime_ns INTEGER,
+    dev INTEGER,
+    inode INTEGER,
+    blake3 TEXT,
+    sidecar_path TEXT,
+    scanned_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audio_facts (
+    path TEXT PRIMARY KEY,
+    duration_sec REAL,
+    codec TEXT,
+    container TEXT,
+    sample_rate INTEGER,
+    channels INTEGER,
+    bits_per_sample INTEGER,
+    bitrate INTEGER,
+    chromaprint TEXT,
+    chromaprint_duration INTEGER,
+    audio_hash TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tag_facts (
+    path TEXT PRIMARY KEY,
+    tag_hash TEXT,
+    artist TEXT,
+    album TEXT,
+    album_artist TEXT,
+    title TEXT,
+    date TEXT,
+    track_number INTEGER,
+    disc_number INTEGER,
+    genre TEXT
+);
+
+CREATE TABLE IF NOT EXISTS library_classification (
+    subject_path TEXT PRIMARY KEY,
+    media_kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    confirmed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_indexed_files_blake3 ON indexed_files(blake3);
+CREATE INDEX IF NOT EXISTS idx_audio_facts_chromaprint ON audio_facts(chromaprint);
+CREATE INDEX IF NOT EXISTS idx_audio_facts_audio_hash ON audio_facts(audio_hash);
+CREATE INDEX IF NOT EXISTS idx_tag_facts_artist_album ON tag_facts(artist, album);
 """
 
 
@@ -248,6 +302,210 @@ def delete_album(conn: sqlite3.Connection, path: str) -> None:
     conn.execute("DELETE FROM album_loudness WHERE path = ?", (path,))
 
 
+# --- Library index helpers ---
+
+
+def get_indexed_file(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
+    """Return indexed file facts by absolute path."""
+    return conn.execute(
+        "SELECT * FROM indexed_files WHERE path = ?", (path,),
+    ).fetchone()
+
+
+def indexed_file_unchanged(
+    row: sqlite3.Row | None, *, size: int, mtime_ns: int,
+) -> bool:
+    """Return whether an indexed row matches the current cheap stat facts."""
+    if row is None:
+        return False
+    return row["size"] == size and row["mtime_ns"] == mtime_ns
+
+
+def upsert_indexed_file(
+    conn: sqlite3.Connection,
+    *,
+    path: str,
+    root: str,
+    relative_path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int | None,
+    dev: int | None,
+    inode: int | None,
+    blake3: str | None,
+    sidecar_path: str | None,
+    scanned_at: str,
+) -> None:
+    """Insert or replace file-level index facts."""
+    conn.execute(
+        """\
+        INSERT OR REPLACE INTO indexed_files
+            (path, root, relative_path, size, mtime_ns, ctime_ns, dev, inode,
+             blake3, sidecar_path, scanned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            path, root, relative_path, size, mtime_ns, ctime_ns, dev, inode,
+            blake3, sidecar_path, scanned_at,
+        ),
+    )
+
+
+def get_audio_facts(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
+    """Return cached audio facts by absolute path."""
+    return conn.execute(
+        "SELECT * FROM audio_facts WHERE path = ?", (path,),
+    ).fetchone()
+
+
+def upsert_audio_facts(
+    conn: sqlite3.Connection,
+    *,
+    path: str,
+    duration_sec: float | None,
+    codec: str | None,
+    container: str | None,
+    sample_rate: int | None,
+    channels: int | None,
+    bits_per_sample: int | None,
+    bitrate: int | None,
+    chromaprint: str | None,
+    chromaprint_duration: int | None,
+    audio_hash: str | None,
+) -> None:
+    """Insert or replace audio stream/fingerprint facts."""
+    conn.execute(
+        """\
+        INSERT OR REPLACE INTO audio_facts
+            (path, duration_sec, codec, container, sample_rate, channels,
+             bits_per_sample, bitrate, chromaprint, chromaprint_duration,
+             audio_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            path, duration_sec, codec, container, sample_rate, channels,
+            bits_per_sample, bitrate, chromaprint, chromaprint_duration,
+            audio_hash,
+        ),
+    )
+
+
+def get_tag_facts(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
+    """Return cached normalized tag facts by absolute path."""
+    return conn.execute(
+        "SELECT * FROM tag_facts WHERE path = ?", (path,),
+    ).fetchone()
+
+
+def upsert_tag_facts(
+    conn: sqlite3.Connection,
+    *,
+    path: str,
+    tag_hash: str,
+    artist: str | None,
+    album: str | None,
+    album_artist: str | None,
+    title: str | None,
+    date: str | None,
+    track_number: int | None,
+    disc_number: int | None,
+    genre: str | None,
+) -> None:
+    """Insert or replace normalized tag facts."""
+    conn.execute(
+        """\
+        INSERT OR REPLACE INTO tag_facts
+            (path, tag_hash, artist, album, album_artist, title, date,
+             track_number, disc_number, genre)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            path, tag_hash, artist, album, album_artist, title, date,
+            track_number, disc_number, genre,
+        ),
+    )
+
+
+def upsert_library_classification(
+    conn: sqlite3.Connection,
+    *,
+    subject_path: str,
+    media_kind: str,
+    source: str,
+    confidence: float,
+    confirmed_at: str | None,
+) -> None:
+    """Insert or replace media-kind classification for a path."""
+    conn.execute(
+        """\
+        INSERT OR REPLACE INTO library_classification
+            (subject_path, media_kind, source, confidence, confirmed_at)
+        VALUES (?, ?, ?, ?, ?)""",
+        (subject_path, media_kind, source, confidence, confirmed_at),
+    )
+
+
+def get_library_classification(
+    conn: sqlite3.Connection, subject_path: str,
+) -> sqlite3.Row | None:
+    """Return media-kind classification for a path."""
+    return conn.execute(
+        "SELECT * FROM library_classification WHERE subject_path = ?",
+        (subject_path,),
+    ).fetchone()
+
+
+def get_effective_library_classification(
+    conn: sqlite3.Connection, subject_path: str,
+) -> sqlite3.Row | None:
+    """Return the nearest inherited media-kind classification for a path.
+
+    Manual classifications on ancestors override lower-confidence automatic
+    file rows. Among manual rows, the nearest ancestor wins.
+    """
+    candidates = _path_candidates(subject_path)
+    if not candidates:
+        return None
+
+    placeholders = ", ".join("?" for _ in candidates)
+    rows = conn.execute(
+        f"""\
+        SELECT * FROM library_classification
+        WHERE subject_path IN ({placeholders})
+        """,
+        candidates,
+    ).fetchall()
+    by_path = {row["subject_path"]: row for row in rows}
+    matches = [by_path[p] for p in candidates if p in by_path]
+    if not matches:
+        return None
+
+    for row in matches:
+        if row["source"] == "manual":
+            return row
+    return matches[0]
+
+
+def _path_candidates(subject_path: str) -> list[str]:
+    path = Path(subject_path).resolve(strict=False)
+    return [str(path), *(str(parent) for parent in path.parents)]
+
+
+def index_stats(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return table counts for the library index."""
+    return {
+        "indexed_files": conn.execute(
+            "SELECT COUNT(*) FROM indexed_files",
+        ).fetchone()[0],
+        "audio_facts": conn.execute(
+            "SELECT COUNT(*) FROM audio_facts",
+        ).fetchone()[0],
+        "tag_facts": conn.execute(
+            "SELECT COUNT(*) FROM tag_facts",
+        ).fetchone()[0],
+        "library_classification": conn.execute(
+            "SELECT COUNT(*) FROM library_classification",
+        ).fetchone()[0],
+    }
+
+
 # --- Tape project helpers ---
 
 
@@ -368,3 +626,56 @@ def update_tape_item_side(
 def delete_tape_item(conn: sqlite3.Connection, item_id: int) -> None:
     """Delete a tape item by id."""
     conn.execute("DELETE FROM tape_item WHERE id = ?", (item_id,))
+
+
+_PATH_COLUMNS = [
+    ("track_loudness", "path"),
+    ("track_loudness", "album_path"),
+    ("album_loudness", "path"),
+    ("tape_item", "path"),
+    ("indexed_files", "path"),
+    ("indexed_files", "root"),
+    ("audio_facts", "path"),
+    ("tag_facts", "path"),
+    ("library_classification", "subject_path"),
+]
+
+
+def find_tape_references(
+    conn: sqlite3.Connection, path_prefix: str,
+) -> list[tuple[str, str]]:
+    """Return [(project_name, item_path), ...] for tape items under path_prefix."""
+    rows = conn.execute(
+        """\
+        SELECT tp.name, ti.path
+        FROM tape_item ti
+        JOIN tape_project tp ON ti.project_id = tp.id
+        WHERE ti.path = ? OR ti.path LIKE ? || '/%'""",
+        (path_prefix, path_prefix),
+    ).fetchall()
+    return [(row[0], row[1]) for row in rows]
+
+
+def relocate_paths(
+    conn: sqlite3.Connection, old_prefix: str, new_prefix: str,
+) -> dict[str, int]:
+    """Update all path references from old_prefix to new_prefix.
+
+    Handles both exact matches (file rename) and prefix matches
+    (directory rename affecting all children). Returns a dict of
+    ``table.column: count`` for columns that had updates.
+    """
+    assert old_prefix != new_prefix
+    old_len = len(old_prefix)
+    counts: dict[str, int] = {}
+    for table, column in _PATH_COLUMNS:
+        cursor = conn.execute(
+            f"UPDATE {table} "  # noqa: S608 — table/column from constant list
+            f"SET {column} = ? || SUBSTR({column}, ?) "
+            f"WHERE {column} = ? OR {column} LIKE ? || '/%'",
+            (new_prefix, old_len + 1, old_prefix, old_prefix),
+        )
+        if cursor.rowcount > 0:
+            counts[f"{table}.{column}"] = cursor.rowcount
+    conn.commit()
+    return counts

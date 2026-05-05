@@ -2,13 +2,15 @@
 
 import collections.abc
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from musiktool import db
 from musiktool.constants import AUDIO_EXTENSIONS, collect_audio_files
 from musiktool.exceptions import AudioReadError
+from musiktool.ignore import IgnorePolicy, load_ignore_policy
+from musiktool.index import IndexScanSummary, scan_path
 from musiktool.loudness import LoudnessInfo, measure_album, measure_track
 
 
@@ -19,6 +21,11 @@ class AlbumResult:
     skipped: int
     removed: int
     error: str | None = None
+    index_files_total: int = 0
+    index_files_indexed: int = 0
+    index_files_skipped: int = 0
+    index_files_from_sidecar: int = 0
+    index_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -28,37 +35,88 @@ class AnalyzeSummary:
     tracks_skipped: int
     tracks_removed: int
     errors: list[str]
+    index_files_total: int = 0
+    index_files_indexed: int = 0
+    index_files_skipped: int = 0
+    index_files_from_sidecar: int = 0
+    index_warnings: list[str] = field(default_factory=list)
 
 
-def discover_albums(lib_path: Path) -> list[Path]:
+def discover_albums(
+    lib_path: Path,
+    *,
+    excludes: list[str] | None = None,
+    ignore_policy: IgnorePolicy | None = None,
+) -> list[Path]:
     """Find all album directories under a library path.
 
     An album directory is any directory that directly contains audio files.
     Walks the tree recursively — supports Artist/Album and deeper structures.
     """
+    lib_path = lib_path.resolve()
+    if ignore_policy is None:
+        ignore_policy = load_ignore_policy(lib_path, excludes=excludes)
+
     albums = []
-    for p in sorted(lib_path.rglob("*")):
-        if not p.is_dir():
-            continue
+    for current, dirs, _names in lib_path.walk():
+        dirs[:] = [
+            name for name in dirs
+            if not ignore_policy.is_ignored(current / name, is_dir=True)
+        ]
+        p = current
         has_audio = any(
             f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+            and not ignore_policy.is_ignored(f, is_dir=False)
             for f in p.iterdir()
         )
         if has_audio:
-            albums.append(p)
-    return albums
+            albums.append(p.resolve())
+    return sorted(set(albums))
 
 
 def analyze_album(
-    album_path: Path, conn: sqlite3.Connection, *, force: bool = False,
+    album_path: Path,
+    conn: sqlite3.Connection,
+    *,
+    force: bool = False,
+    use_index: bool = False,
+    sidecar_root: Path | None = None,
+    hash_index: bool = False,
+    fingerprint_index: bool = False,
+    excludes: list[str] | None = None,
+    ignore_policy: IgnorePolicy | None = None,
 ) -> AlbumResult:
     """Analyze a single album directory. Measures only stale/new tracks."""
     album_path = album_path.resolve()
-    audio_files = [p.resolve() for p in collect_audio_files(album_path)]
+    if ignore_policy is None:
+        ignore_policy = load_ignore_policy(album_path, excludes=excludes)
+    index_summary: IndexScanSummary | None = None
+    if use_index:
+        index_summary = scan_path(
+            album_path,
+            conn,
+            sidecar_root=sidecar_root,
+            force=force,
+            hash_files=hash_index,
+            fingerprint_files=fingerprint_index,
+            excludes=excludes,
+            ignore_policy=ignore_policy,
+        )
+
+    audio_files = [
+        p.resolve() for p in collect_audio_files(album_path)
+        if not ignore_policy.is_ignored(p, is_dir=False)
+    ]
     album_str = str(album_path)
 
     if not audio_files:
-        return AlbumResult(path=album_str, measured=0, skipped=0, removed=0)
+        return AlbumResult(
+            path=album_str,
+            measured=0,
+            skipped=0,
+            removed=0,
+            **_album_index_result(index_summary),
+        )
 
     # Current file mtimes
     file_mtimes = {str(f): f.stat().st_mtime for f in audio_files}
@@ -144,6 +202,7 @@ def analyze_album(
         measured=len(stale_paths),
         skipped=skipped,
         removed=len(removed_paths),
+        **_album_index_result(index_summary),
     )
 
 
@@ -152,10 +211,16 @@ def analyze_library(
     db_path: Path,
     *,
     force: bool = False,
+    use_index: bool = False,
+    sidecar_root: Path | None = None,
+    hash_index: bool = False,
+    fingerprint_index: bool = False,
+    excludes: list[str] | None = None,
     progress_fn: collections.abc.Callable | None = None,
 ) -> AnalyzeSummary:
     """Analyze all albums under a library path."""
-    albums = discover_albums(lib_path)
+    ignore_policy = load_ignore_policy(lib_path, excludes=excludes)
+    albums = discover_albums(lib_path, ignore_policy=ignore_policy)
     conn = db.get_connection(db_path)
 
     summary = AnalyzeSummary(
@@ -172,10 +237,25 @@ def analyze_library(
                 progress_fn(i + 1, len(albums), album_path)
 
             try:
-                result = analyze_album(album_path, conn, force=force)
+                result = analyze_album(
+                    album_path,
+                    conn,
+                    force=force,
+                    use_index=use_index,
+                    sidecar_root=sidecar_root,
+                    hash_index=hash_index,
+                    fingerprint_index=fingerprint_index,
+                    excludes=excludes,
+                    ignore_policy=ignore_policy,
+                )
                 summary.tracks_measured += result.measured
                 summary.tracks_skipped += result.skipped
                 summary.tracks_removed += result.removed
+                summary.index_files_total += result.index_files_total
+                summary.index_files_indexed += result.index_files_indexed
+                summary.index_files_skipped += result.index_files_skipped
+                summary.index_files_from_sidecar += result.index_files_from_sidecar
+                summary.index_warnings.extend(result.index_warnings)
             except Exception as e:
                 msg = f"{album_path}: {e}"
                 summary.errors.append(msg)
@@ -183,3 +263,17 @@ def analyze_library(
         conn.close()
 
     return summary
+
+
+def _album_index_result(
+    summary: IndexScanSummary | None,
+) -> dict[str, object]:
+    if summary is None:
+        return {}
+    return {
+        "index_files_total": summary.files_total,
+        "index_files_indexed": summary.files_indexed,
+        "index_files_skipped": summary.files_skipped,
+        "index_files_from_sidecar": summary.files_from_sidecar,
+        "index_warnings": list(summary.warnings),
+    }

@@ -19,7 +19,9 @@ app = typer.Typer(
     pretty_exceptions_enable=False,  # we handle MusiktoolError ourselves
 )
 tape_app = typer.Typer(help="Tape mastering project management")
+index_app = typer.Typer(help="Library file index management")
 app.add_typer(tape_app, name="tape")
+app.add_typer(index_app, name="index")
 
 
 @app.command()
@@ -149,6 +151,11 @@ def analyze(
     path: Path = typer.Argument(..., help="Library root or album directory to analyze"),
     db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
     force: bool = typer.Option(False, "--force", "-f", help="Re-analyze all tracks regardless of mtime"),
+    use_index: bool = typer.Option(True, "--index/--no-index", help="Refresh file index facts during analysis"),
+    sidecar_root: Path = typer.Option(None, "--sidecar-root", help="Out-of-tree sidecar root"),
+    hash_index: bool = typer.Option(False, "--hash-index", help="Compute exact-file BLAKE3 hashes while refreshing the index"),
+    fingerprint_index: bool = typer.Option(False, "--fingerprint-index", help="Compute Chromaprint fingerprints while refreshing the index"),
+    exclude: list[str] | None = typer.Option(None, "--exclude", help="Additional gitignore-style pattern to exclude"),
 ):
     """Bulk EBU R128 analysis into analytics DB (incremental)."""
     from musiktool.analyze import (
@@ -172,12 +179,31 @@ def analyze(
         def progress(i: int, total: int, album: Path) -> None:
             typer.echo(f"[{i}/{total}] {album.parent.name}/{album.name}")
 
-        summary = analyze_library(path, db_path, force=force, progress_fn=progress)
+        summary = analyze_library(
+            path,
+            db_path,
+            force=force,
+            use_index=use_index,
+            sidecar_root=sidecar_root,
+            hash_index=hash_index,
+            fingerprint_index=fingerprint_index,
+            excludes=exclude,
+            progress_fn=progress,
+        )
 
         typer.echo(f"\n{summary.albums} albums, "
                    f"{summary.tracks_measured} measured, "
                    f"{summary.tracks_skipped} skipped, "
                    f"{summary.tracks_removed} removed")
+        if use_index:
+            typer.echo(
+                f"Index: {summary.index_files_total} files, "
+                f"{summary.index_files_indexed} refreshed, "
+                f"{summary.index_files_from_sidecar} from sidecar, "
+                f"{summary.index_files_skipped} current"
+            )
+            if summary.index_warnings:
+                typer.echo(f"Index warnings: {len(summary.index_warnings)}")
         if summary.errors:
             typer.echo(f"\n{len(summary.errors)} errors:")
             for err in summary.errors:
@@ -186,11 +212,27 @@ def analyze(
         # Single album directory
         conn = db.get_connection(db_path)
         try:
-            result = do_analyze_album(path, conn, force=force)
+            result = do_analyze_album(
+                path,
+                conn,
+                force=force,
+                use_index=use_index,
+                sidecar_root=sidecar_root,
+                hash_index=hash_index,
+                fingerprint_index=fingerprint_index,
+                excludes=exclude,
+            )
             typer.echo(f"{path.parent.name}/{path.name}: "
                        f"{result.measured} measured, "
                        f"{result.skipped} skipped, "
                        f"{result.removed} removed")
+            if use_index:
+                typer.echo(
+                    f"Index: {result.index_files_total} files, "
+                    f"{result.index_files_indexed} refreshed, "
+                    f"{result.index_files_from_sidecar} from sidecar, "
+                    f"{result.index_files_skipped} current"
+                )
         finally:
             conn.close()
 
@@ -280,20 +322,81 @@ def tags(
 def audit(
     path: Path = typer.Argument(..., help="Library root, staging source, album directory, or track file"),
     against: Path = typer.Option(None, "--against", help="Curated library root to compare against"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
     output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
     severity: str = typer.Option("info", "--severity", help="Minimum severity: info, warning, or error"),
     include_ok: bool = typer.Option(False, "--include-ok", help="Include successful checks in JSON output"),
+    use_index: bool = typer.Option(True, "--index/--no-index", help="Use current index facts when available"),
+    refresh_index: bool = typer.Option(False, "--refresh-index", help="Refresh missing or stale index facts before auditing"),
+    sidecar_root: Path = typer.Option(None, "--sidecar-root", help="Out-of-tree sidecar root"),
+    exclude: list[str] | None = typer.Option(None, "--exclude", help="Additional gitignore-style pattern to exclude"),
+    similarity_threshold: float = typer.Option(0.08, "--similarity-threshold", help="Chromaprint BER threshold for audio duplicate detection (0.0=exact, 0.1=relaxed)"),
 ) -> None:
     """Audit a music library or staging source without modifying files."""
+    import sqlite3
+
+    from musiktool import db
+    from musiktool.index import scan_path
     from musiktool.library import audit_library, format_audit
 
-    result = audit_library(
-        path,
-        against=against,
-        min_severity=severity,
-        include_ok=include_ok,
-    )
-    typer.echo(format_audit(result, output_format), nl=False)
+    def open_required_index_database(value: Path | None):
+        try:
+            return db.get_connection(value)
+        except (OSError, sqlite3.Error) as e:
+            target = value or db.default_db_path()
+            raise ValidationError(
+                f"could not open index database: {target}: {e}"
+            ) from e
+
+    conn = None
+    if refresh_index:
+        conn = open_required_index_database(db_path)
+    elif use_index and db_path is not None:
+        conn = open_required_index_database(db_path)
+    elif use_index:
+        default_db = db.default_db_path()
+        if default_db.exists():
+            try:
+                conn = db.get_connection(default_db)
+            except (OSError, sqlite3.Error):
+                conn = None
+    try:
+        index_scan_summary = None
+        if refresh_index:
+            index_scan_summary = scan_path(
+                path,
+                conn,
+                sidecar_root=sidecar_root,
+                excludes=exclude,
+            )
+        result = audit_library(
+            path,
+            against=against,
+            min_severity=severity,
+            include_ok=include_ok,
+            index_conn=conn if use_index else None,
+            excludes=exclude,
+            similarity_threshold=similarity_threshold,
+        )
+        if index_scan_summary is not None:
+            index_summary = result.summary.setdefault("index", {})
+            index_summary["refresh"] = {
+                "files_total": index_scan_summary.files_total,
+                "files_indexed": index_scan_summary.files_indexed,
+                "files_from_sidecar": index_scan_summary.files_from_sidecar,
+                "files_skipped": index_scan_summary.files_skipped,
+                "warnings": len(index_scan_summary.warnings),
+            }
+            if include_ok:
+                result.checks.append({
+                    "category": "index.refresh",
+                    "status": "ok",
+                    **index_summary["refresh"],
+                })
+        typer.echo(format_audit(result, output_format), nl=False)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @app.command()
@@ -316,26 +419,235 @@ def apply_cmd(
     dry_run: bool = typer.Option(True, "--dry-run/--execute", help="Validate only, or apply changes"),
     output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
     quarantine_dir: Path = typer.Option(None, "--quarantine-dir", help="Destination for quarantine actions"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
 ) -> None:
     """Validate and optionally execute a whitelisted library fix plan."""
+    import sqlite3
     import sys
 
+    from musiktool import db
     from musiktool.library import apply_plan, format_apply
 
-    if str(plan) == "-":
-        result = apply_plan(
-            "-",
-            plan_text=sys.stdin.read(),
-            dry_run=dry_run,
-            quarantine_dir=quarantine_dir,
-        )
+    conn = None
+    if db_path is not None:
+        try:
+            conn = db.get_connection(db_path)
+        except (OSError, sqlite3.Error) as e:
+            raise ValidationError(
+                f"could not open database: {db_path}: {e}"
+            ) from e
     else:
-        result = apply_plan(
-            plan,
-            dry_run=dry_run,
-            quarantine_dir=quarantine_dir,
+        default_db = db.default_db_path()
+        if default_db.exists():
+            try:
+                conn = db.get_connection(default_db)
+            except (OSError, sqlite3.Error):
+                conn = None
+
+    try:
+        if str(plan) == "-":
+            result = apply_plan(
+                "-",
+                plan_text=sys.stdin.read(),
+                dry_run=dry_run,
+                quarantine_dir=quarantine_dir,
+                db_conn=conn,
+            )
+        else:
+            result = apply_plan(
+                plan,
+                dry_run=dry_run,
+                quarantine_dir=quarantine_dir,
+                db_conn=conn,
+            )
+        typer.echo(format_apply(result, output_format), nl=False)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.command()
+def propose(
+    path: Path = typer.Argument(..., help="Library root path"),
+    proposal_type: str = typer.Option(..., "--type", help="Proposal type: year-folders"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+    use_index: bool = typer.Option(True, "--index/--no-index", help="Use current index facts when available"),
+    exclude: list[str] | None = typer.Option(None, "--exclude", help="Additional gitignore-style pattern to exclude"),
+) -> None:
+    """Generate a mechanical fix plan from library analysis."""
+    import sqlite3
+
+    from musiktool import db
+    from musiktool.library import format_propose, propose_year_folders
+
+    if proposal_type != "year-folders":
+        raise ValidationError(f"unknown proposal type: {proposal_type}")
+
+    conn = None
+    if use_index and db_path is not None:
+        try:
+            conn = db.get_connection(db_path)
+        except (OSError, sqlite3.Error) as e:
+            raise ValidationError(
+                f"could not open index database: {db_path}: {e}"
+            ) from e
+    elif use_index:
+        default_db = db.default_db_path()
+        if default_db.exists():
+            try:
+                conn = db.get_connection(default_db)
+            except (OSError, sqlite3.Error):
+                conn = None
+    try:
+        result = propose_year_folders(
+            path,
+            index_conn=conn,
+            excludes=exclude,
         )
-    typer.echo(format_apply(result, output_format), nl=False)
+        typer.echo(format_propose(result, output_format), nl=False)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# --- Index subcommands ---
+
+
+@index_app.command("scan")
+def index_scan_cmd(
+    path: Path = typer.Argument(..., help="Audio file or library root to index"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+    sidecar_root: Path = typer.Option(None, "--sidecar-root", help="Out-of-tree sidecar root"),
+    force: bool = typer.Option(False, "--force", "-f", help="Rescan even when stat cache matches"),
+    hash_files: bool = typer.Option(False, "--hash", help="Compute exact-file BLAKE3 hashes"),
+    fingerprint_files: bool = typer.Option(False, "--fingerprint", help="Compute Chromaprint fingerprints with fpcalc"),
+    exclude: list[str] | None = typer.Option(None, "--exclude", help="Additional gitignore-style pattern to exclude"),
+) -> None:
+    """Scan files into the musiktool index and write sidecars."""
+    from musiktool import db
+    from musiktool.index import scan_path
+
+    conn = db.get_connection(db_path)
+    try:
+        summary = scan_path(
+            path,
+            conn,
+            sidecar_root=sidecar_root,
+            force=force,
+            hash_files=hash_files,
+            fingerprint_files=fingerprint_files,
+            excludes=exclude,
+        )
+    finally:
+        conn.close()
+
+    typer.echo(summary.root)
+    typer.echo(
+        f"  {summary.files_total} files, "
+        f"{summary.files_indexed} indexed, "
+        f"{summary.files_from_sidecar} from sidecar, "
+        f"{summary.files_skipped} skipped"
+    )
+    if summary.files_hashed or summary.files_fingerprinted:
+        typer.echo(
+            f"  {summary.files_hashed} hashed, "
+            f"{summary.files_fingerprinted} fingerprinted"
+        )
+    if summary.warnings:
+        typer.echo(f"  {len(summary.warnings)} warning(s)")
+        for warning in summary.warnings:
+            typer.echo(f"    {warning}")
+
+
+@index_app.command("rebuild")
+def index_rebuild_cmd(
+    path: Path = typer.Argument(..., help="Audio file or library root to rebuild"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+    sidecar_root: Path = typer.Option(None, "--sidecar-root", help="Out-of-tree sidecar root"),
+    hash_files: bool = typer.Option(False, "--hash", help="Compute exact-file BLAKE3 hashes"),
+    fingerprint_files: bool = typer.Option(False, "--fingerprint", help="Compute Chromaprint fingerprints with fpcalc"),
+    exclude: list[str] | None = typer.Option(None, "--exclude", help="Additional gitignore-style pattern to exclude"),
+) -> None:
+    """Re-read files for a path and rewrite index sidecars."""
+    from musiktool import db
+    from musiktool.index import scan_path
+
+    conn = db.get_connection(db_path)
+    try:
+        summary = scan_path(
+            path,
+            conn,
+            sidecar_root=sidecar_root,
+            force=True,
+            hash_files=hash_files,
+            fingerprint_files=fingerprint_files,
+            excludes=exclude,
+        )
+    finally:
+        conn.close()
+
+    typer.echo(
+        f"Rebuilt: {summary.files_indexed} indexed, "
+        f"{summary.sidecars_written} sidecars written"
+    )
+
+
+@index_app.command("status")
+def index_status_cmd(
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+) -> None:
+    """Show library index table counts."""
+    from musiktool import db
+
+    conn = db.get_connection(db_path)
+    try:
+        stats = db.index_stats(conn)
+    finally:
+        conn.close()
+
+    typer.echo("Library index")
+    for name, count in stats.items():
+        typer.echo(f"  {name}: {count}")
+
+
+@index_app.command("classify")
+def index_classify_cmd(
+    path: Path = typer.Argument(..., help="File or directory to classify"),
+    media_kind: str = typer.Argument(..., help="Media kind: music, radio, audiobook, or podcast"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+) -> None:
+    """Store a confirmed media-kind classification."""
+    from datetime import datetime, timezone
+
+    from musiktool import db
+
+    allowed = {"music", "radio", "audiobook", "podcast"}
+    if media_kind not in allowed:
+        raise ValidationError(
+            f"unknown media kind: {media_kind} "
+            f"(available: {', '.join(sorted(allowed))})"
+        )
+
+    subject = path.resolve()
+    if not subject.exists():
+        raise PathNotFoundError(f"path does not exist: {subject}")
+
+    conn = db.get_connection(db_path)
+    try:
+        db.upsert_library_classification(
+            conn,
+            subject_path=str(subject),
+            media_kind=media_kind,
+            source="manual",
+            confidence=1.0,
+            confirmed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    typer.echo(f"{subject}: {media_kind}")
 
 
 # --- Tape subcommands ---

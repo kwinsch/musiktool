@@ -10,10 +10,15 @@ musiktool apply <plan.json> [options]
 
 ## DESCRIPTION
 
-Audit, inspect, and safely maintain a music library in the `Artist/Album
-(Year)/NN Title.ext` layout. These commands are designed for two consumers:
-humans reading concise terminal output, and local agents reading stable JSON
-so they can propose conservative fix plans.
+Audit, inspect, and safely maintain an audio library. The command design
+borrows the useful part of classic iTunes: files have a **media kind**, and
+different media kinds belong in different library sections. Music, radio
+shows, audiobooks, and podcasts should not all be forced into the same album
+rules.
+
+These commands are designed for two consumers: humans reading concise terminal
+output, and local agents reading stable JSON so they can propose conservative
+fix plans.
 
 The library-maintenance workflow is intentionally split into three phases:
 
@@ -41,6 +46,109 @@ for very large sources such as old iTunes libraries.
 JSON output must be treated as the compatibility contract. Text output may
 change as the command becomes more readable.
 
+## MEDIA KINDS AND PROFILES
+
+Old iTunes got the core model right in the iPod era: **Media Kind** decides
+where an item appears and which rules apply. A podcast is not music with a
+`Podcast` genre; it is a podcast. An audiobook is not an album with a
+`Spoken Word` genre; it is an audiobook. This keeps shuffle, browsing, sync,
+and metadata expectations sane.
+
+`musiktool` uses the same idea, but keeps the filesystem cleaner than the old
+`iTunes Music/` folder. The intended top-level library layout is:
+
+```
+lib/
+  music/
+    Artist/
+      Album (Year)/
+        NN Title.ext
+        *.cue
+        *.log
+
+  radio/
+    Show/
+      Collection or Season/
+        NNN Episode Title.ext
+
+  audiobooks/
+    Author or Series/
+      Work (Year)/
+        NNN Chapter or Part.ext
+
+  podcasts/
+    Show/
+      YYYY/
+        YYYY-MM-DD Episode Title.ext
+```
+
+The initial `audit` implementation still applies the music profile by default.
+Future profile support should expose this explicitly:
+
+```
+musiktool audit ~/Music/lib/music --profile music
+musiktool audit ~/Music/lib/radio --profile radio
+musiktool audit ~/Music/lib/audiobooks --profile audiobook
+musiktool audit ~/Music/lib/podcasts --profile podcast
+musiktool audit ~/Music/lib --profile auto
+```
+
+### Profile Rules
+
+| Profile | Intended content | Structure | Required metadata |
+|---|---|---|---|
+| `music` | Albums, singles, compilations, soundtracks | `Artist/Album (Year)/NN Title.ext` | artist, album, title, track number, date/year |
+| `radio` | Broadcast radio shows, radio drama, comedy series | `Show/Collection/NNN Episode Title.ext` | show/series, episode title, episode number if known |
+| `audiobook` | Books, readings, lectures sold or ripped as books | `Author or Series/Work (Year)/NNN Part.ext` | author/narrator if known, work title, part/chapter number |
+| `podcast` | Subscribed feed episodes | `Show/YYYY/YYYY-MM-DD Episode Title.ext` | show, episode title, publish date |
+
+Profiles change audit expectations. Music should preserve CUE sheets and EAC
+logs when available. Radio, audiobook, and podcast profiles should not report
+missing CUE/EAC provenance as a problem. Music filenames are track-oriented;
+spoken profiles are episode/part-oriented. Spoken content should usually be
+excluded from music shuffle and music-only tape projects unless deliberately
+selected.
+
+## IGNORE POLICY
+
+Library scans use gitignore-style rules. `musiktool` merges built-in defaults,
+an optional `.musiktoolignore` file at the selected root, and repeated
+`--exclude` patterns from the CLI.
+
+Built-in defaults ignore generated and operational paths such as `.Trash-*`,
+`.git/`, `.hg/`, `__pycache__/`, `_quarantine/`, `musiktool/render/`, `*.db`,
+and `*.sqlite`.
+
+Examples:
+
+```
+# .musiktoolignore
+incoming-dumps/
+transcoded-preview/
+*.tmp.flac
+```
+
+Rules are interpreted relative to the selected command root.
+
+### Philip Maloney
+
+`Philip Maloney` is a Swiss radio show, not a music album. It should be
+managed as `radio`, for example:
+
+```
+lib/radio/
+  Philip Maloney/
+    Die haarsträubenden Fälle des Philip Maloney/
+      001 Rosen.mp3
+      002 Blind Date.mp3
+      003 Das Appartement.mp3
+```
+
+Under the music profile those files correctly trigger missing music tags and
+filename findings. Under the radio profile the useful checks are different:
+episode numbering, episode titles, duplicate episodes, and optional broadcast
+or collection metadata.
+
 ## COMMANDS
 
 ### audit
@@ -63,6 +171,13 @@ musiktool audit <path> [options]
 | `--format` | `text` | Output format: `text`, `json`, or `ndjson`. |
 | `--severity` | `info` | Minimum severity to report: `info`, `warning`, or `error`. |
 | `--include-ok` | off | Include successful checks in JSON output. |
+| `--db` | default DB | Optional index DB path. Explicit DB failures are errors. |
+| `--index` / `--no-index` | `--index` | Use current indexed facts when available. Implicit default DB use is best-effort. |
+| `--refresh-index` | off | Refresh missing or stale index facts before auditing. |
+| `--sidecar-root` | default sidecar root | Out-of-tree sidecar root for index refresh. |
+| `--exclude` | repeatable | Additional gitignore-style pattern to exclude. |
+| `--similarity-threshold` | `0.08` | Chromaprint BER threshold for audio duplicate detection. Lower = stricter (0.0 = exact only, 0.01 = codec transcodes, 0.08 = default, 0.15 = catches remasters). |
+| `--profile` | `music` | Planned option: audit profile, one of `music`, `radio`, `audiobook`, `podcast`, or `auto`. |
 
 **Checks:**
 
@@ -76,8 +191,9 @@ musiktool audit <path> [options]
 - Compilation albums preserve per-track artists while using album artist
   consistently.
 - CUE sheets and EAC logs are preserved when present.
-- Duplicate candidates are detected by track count, duration, tags, format,
-  and provenance evidence.
+- Duplicate candidates are layered by evidence: exact BLAKE3 file identity,
+  Chromaprint audio identity, or strong title/duration/artist/album agreement.
+  Title-only matches are informational, not actionable warnings.
 - Staging sources can be compared against the curated library with `--against`.
 
 **Examples:**
@@ -87,6 +203,7 @@ musiktool audit ~/Music/lib
 musiktool audit ~/Music/lib --format json
 musiktool audit ~/Music/incoming --against ~/Music/lib --format ndjson
 musiktool audit ~/Music/iTunes --against ~/Music/lib --severity warning
+musiktool audit ~/Music --exclude 'incoming-dumps/'
 ```
 
 **Text output example:**
@@ -108,6 +225,25 @@ musiktool audit ~/Music/iTunes --against ~/Music/lib --severity warning
 
 3 findings
 ```
+
+### index
+
+Build and inspect the sidecar-backed file index used by `audit` and `analyze`.
+
+```
+musiktool index scan <path> [options]
+musiktool index rebuild <path> [options]
+musiktool index status [options]
+musiktool index classify <path> <media-kind> [options]
+```
+
+`scan` refreshes stale or missing facts. `rebuild` forces a live rescan and
+rewrites sidecars. Both commands accept `--hash`, `--fingerprint`,
+`--sidecar-root`, and repeatable `--exclude` patterns.
+
+`classify` stores a confirmed media kind: `music`, `radio`, `audiobook`, or
+`podcast`. Directory classifications inherit to descendants; a more specific
+manual classification on a child path overrides its parent.
 
 ### inspect
 
@@ -169,6 +305,68 @@ musiktool apply <plan.json> [options]
   actions.
 - Destructive deletion is not a first-class action. Use `quarantine`.
 - `--dry-run` is the default and must produce enough detail for review.
+
+### propose
+
+Generate a mechanical fix plan for zero-judgment operations. The output is a
+valid fix plan JSON that can be piped directly to `apply`.
+
+```
+musiktool propose <path> --type <proposal-type> [options]
+```
+
+**Arguments:**
+
+- `path` — Library root path to scan.
+
+**Options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `--type` | *(required)* | Proposal type. Currently: `year-folders`. |
+| `--format` | `text` | Output format: `text`, `json`, or `ndjson`. |
+| `--db` | default DB | Optional index DB path. |
+| `--index` / `--no-index` | `--index` | Use current indexed facts when available. |
+| `--exclude` | repeatable | Additional gitignore-style pattern to exclude. |
+
+**Proposal types:**
+
+| Type | Actions | Logic |
+|---|---|---|
+| `year-folders` | `rename_album_dir` | Adds `(Year)` to album directories using consensus tag year. Skips albums where tracks disagree on year or destination already exists. |
+
+**Boundary:** `propose` only handles operations where there is exactly one
+correct answer. Naming corrections (e.g. "Black Album" → "Metallica"),
+duplicate resolution, and format preferences require agent judgment and should
+be handled through the audit → inspect → apply workflow.
+
+**Examples:**
+
+```
+# Preview proposed renames
+musiktool propose ~/Music/lib --type year-folders
+
+# Generate plan and dry-run it
+musiktool propose ~/Music/lib --type year-folders --format json | musiktool apply -
+
+# Generate, review, and execute
+musiktool propose ~/Music/lib --type year-folders --format json > plan.json
+# Agent or human reviews plan.json, possibly edits it
+musiktool apply plan.json --execute
+```
+
+**Text output example:**
+
+```
+Propose: year-folders (3 rename(s), 0 skipped)
+
+  Can I Play With Madness  →  Can I Play With Madness (1990)
+  Killers  →  Killers (1981)
+  No Prayer For The Dying  →  No Prayer For The Dying (1990)
+
+Pipe JSON to apply:
+  musiktool propose <path> --type year-folders --format json | musiktool apply - --execute
+```
 
 ## JSON SCHEMA
 
@@ -241,7 +439,7 @@ Initial categories:
 
 | Category | Severity | Description |
 |---|---|---|
-| `structure.album_year_missing` | warning | Album folder does not end in `(Year)`. |
+| `structure.album_year_missing` | warning | Album folder does not end in `(Year)`. Evidence includes `tag_year` (consensus year from track tags, or null) and `suggested_name` (proposed folder name, or null). When a tag year is found and the destination doesn't exist, `suggested_actions` includes the computed `destination`. |
 | `structure.album_year_invalid` | warning | Album folder year is malformed or implausible. |
 | `structure.nested_album` | warning | Album-like directory found below another album. |
 | `structure.stray_file` | info | Non-audio/non-provenance file in an unusual location. |
@@ -251,7 +449,7 @@ Initial categories:
 | `tracks.filename_pattern` | info | Filename does not follow `NN Title.ext`. |
 | `provenance.cue_missing` | info | No CUE sheet found for an album. |
 | `provenance.eac_log_missing` | info | No EAC log found for an album. |
-| `duplicates.same_album_candidate` | warning | Two album dirs appear to contain the same album. |
+| `duplicates.same_album_candidate` | info/warning | Two album dirs may contain the same album. Weak title-only matches are info; exact, audio, or strong metadata matches are warning. Evidence includes `evidence_type` (`exact_file`, `audio_fingerprint`, `strong_album_metadata`, `weak_title_overlap`). For `audio_fingerprint`, also includes `similarity_ber` (bit error rate) and `similarity_threshold` used. |
 | `duplicates.source_already_curated` | warning | Staging source appears to duplicate an existing library album. |
 
 ## FIX PLAN SCHEMA
@@ -309,13 +507,22 @@ musiktool inspect "~/Music/incoming/Apocalyptica" --against ~/Music/lib --format
 musiktool apply incoming-fix-plan.json --dry-run
 ```
 
+### Mechanical Fixes (Propose)
+
+```
+musiktool propose ~/Music/lib --type year-folders --format json | musiktool apply -
+musiktool propose ~/Music/lib --type year-folders --format json > plan.json
+musiktool apply plan.json --execute
+```
+
 ### Agent Loop
 
-1. Run `audit --format json`.
-2. For each high-confidence fixable warning, call `inspect --format json`.
-3. Produce a fix plan with only whitelisted actions.
-4. Run `apply --dry-run --format json` and check validation results.
-5. Ask for human approval before `apply --execute`.
+1. Run `propose --format json` for mechanical fixes; review and apply.
+2. Run `audit --format json` for remaining findings.
+3. For each high-confidence fixable warning, call `inspect --format json`.
+4. Produce a fix plan with only whitelisted actions.
+5. Run `apply --dry-run --format json` and check validation results.
+6. Ask for human approval before `apply --execute`.
 
 ## SEE ALSO
 
