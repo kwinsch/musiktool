@@ -17,6 +17,7 @@ from musiktool.library import (
     format_audit,
     format_propose,
     inspect_path,
+    propose_classify,
     propose_media_kind_folders,
     propose_year_folders,
 )
@@ -40,6 +41,7 @@ def _index_track(
     duration_sec: float | None = None,
     blake3: str | None = None,
     chromaprint: str | None = None,
+    genre: str | None = None,
 ) -> None:
     track = track.resolve()
     root = root.resolve()
@@ -83,7 +85,7 @@ def _index_track(
         date="2000" if artist or album or title else None,
         track_number=track_number,
         disc_number=None,
-        genre=None,
+        genre=genre,
     )
 
 
@@ -1872,6 +1874,237 @@ def test_propose_media_kind_inherits_ancestor(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# propose_classify
+# ---------------------------------------------------------------------------
+
+
+def test_propose_classify_suggests_audiobook_from_genre(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Author" / "Book" / "01 Chapter 1.mp3")
+    t2 = _touch(root / "Author" / "Book" / "02 Chapter 2.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Author", title="Chapter 1", genre="Books & Spoken")
+    _index_track(conn, root, t2, artist="Author", title="Chapter 2", genre="Books & Spoken")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 1
+    action = result.actions[0]
+    assert action["type"] == "classify"
+    assert action["media_kind"] == "audiobook"
+    assert action["confidence"] == 0.85
+    assert action["subject_path"] == str((root / "Author" / "Book").resolve())
+    assert action["evidence"]["genre_counts"] == {"Books & Spoken": 2}
+    assert len(result.skipped) == 0
+
+
+def test_propose_classify_suggests_radio_from_hoerspiel(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Show" / "Season 1" / "01 Episode.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Show", title="Episode", genre="Hörspiel")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 1
+    assert result.actions[0]["media_kind"] == "radio"
+    assert result.actions[0]["confidence"] == 0.80
+
+
+def test_propose_classify_suggests_podcast_from_genre(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Pod" / "Ep1" / "01 Episode.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Pod", title="Ep1", genre="Podcast")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 1
+    assert result.actions[0]["media_kind"] == "podcast"
+    assert result.actions[0]["confidence"] == 0.85
+
+
+def test_propose_classify_skips_manual_classification(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Author" / "Book" / "01 Chapter.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Author", title="Chapter", genre="Books & Spoken")
+    db.upsert_library_classification(
+        conn,
+        subject_path=str((root / "Author").resolve()),
+        media_kind="audiobook",
+        source="manual",
+        confidence=1.0,
+        confirmed_at="2026-05-05T00:00:00+00:00",
+    )
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 0
+    assert len(result.skipped) == 1
+    assert result.skipped[0]["reason"] == "already_classified"
+
+
+def test_propose_classify_ignores_root_level_manual(tmp_path: Path) -> None:
+    """A manual classification on the library root does not block proposals."""
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Author" / "Book" / "01 Chapter.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Author", title="Chapter", genre="Audiobook")
+    db.upsert_library_classification(
+        conn,
+        subject_path=str(root.resolve()),
+        media_kind="music",
+        source="manual",
+        confidence=1.0,
+        confirmed_at="2026-05-05T00:00:00+00:00",
+    )
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 1
+    assert result.actions[0]["media_kind"] == "audiobook"
+
+
+def test_propose_classify_skips_no_genre(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Artist" / "Album" / "01 Song.flac")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Artist", title="Song")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 0
+    assert len(result.skipped) == 1
+    assert result.skipped[0]["reason"] == "no_genre_data"
+
+
+def test_propose_classify_skips_music_genre(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Artist" / "Album" / "01 Song.flac")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Artist", title="Song", genre="Rock")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 0
+    assert len(result.skipped) == 1
+    assert result.skipped[0]["reason"] == "already_default"
+
+
+def test_propose_classify_skips_ambiguous_genres(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Mix" / "Album" / "01 Track.mp3")
+    t2 = _touch(root / "Mix" / "Album" / "02 Track.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Mix", title="T1", genre="Podcast")
+    _index_track(conn, root, t2, artist="Mix", title="T2", genre="Hörspiel")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    assert len(result.actions) == 0
+    assert len(result.skipped) == 1
+    assert result.skipped[0]["reason"] == "ambiguous_genre"
+
+
+def test_propose_classify_apply_roundtrip(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Author" / "Book" / "01 Chapter.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Author", title="Chapter", genre="Audiobook")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    assert len(result.actions) == 1
+
+    plan_json = json.dumps(result.to_plan())
+
+    # Dry run
+    apply_result = apply_plan("-", plan_text=plan_json, dry_run=True, db_conn=conn)
+    assert apply_result.valid
+    assert apply_result.actions[0].status == "would_apply"
+
+    # Execute
+    apply_result = apply_plan("-", plan_text=plan_json, dry_run=False, db_conn=conn)
+    assert apply_result.actions[0].status == "applied"
+    assert apply_result.actions[0].db_updates == {"library_classification": 1}
+
+    # Verify DB was written
+    cls = db.get_library_classification(
+        conn, str((root / "Author" / "Book").resolve()),
+    )
+    assert cls is not None
+    assert cls["media_kind"] == "audiobook"
+    assert cls["source"] == "genre"
+    assert cls["confidence"] == 0.85
+
+    conn.close()
+
+
+def test_propose_classify_text_format(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Show" / "Season" / "01 Ep.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Show", title="Ep", genre="Radio Drama")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    text = format_propose(result, "text")
+    assert "classification" in text.lower()
+    assert "radio" in text
+    assert "Radio Drama" in text
+
+
+def test_propose_classify_json_format(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    t1 = _touch(root / "Author" / "Book" / "01 Ch.mp3")
+
+    conn = db.get_connection(tmp_path / "analytics.db")
+    _index_track(conn, root, t1, artist="Author", title="Ch", genre="Hörbuch")
+    conn.commit()
+
+    result = propose_classify(root, conn=conn)
+    conn.close()
+
+    data = result.to_dict()
+    assert data["proposal_type"] == "classify"
+    assert data["summary"]["proposed"] == 1
+    action = data["actions"][0]
+    assert action["type"] == "classify"
+    assert action["media_kind"] == "audiobook"
+    assert "subject_path" in action
+    assert "evidence" in action
+
+
+# ---------------------------------------------------------------------------
 # Profile-aware audit
 # ---------------------------------------------------------------------------
 
@@ -2350,6 +2583,92 @@ def test_prune_nothing_to_do(tmp_path: Path) -> None:
         root_str = str(root.resolve()) + "/"
         counts = db.prune_missing(conn, root_str)
         assert counts == {}
+    finally:
+        conn.close()
+
+
+def test_prune_removes_orphan_loudness_rows(tmp_path: Path) -> None:
+    """Loudness rows left by out-of-band moves are pruned even when
+    indexed_files has no corresponding entry (the typical case after
+    manual quarantine or ``mv``)."""
+    root = tmp_path / "lib"
+    album_dir = root / "Artist" / "Album (2020)"
+    t1 = _touch(album_dir / "01 Track.flac")
+    t2 = _touch(album_dir / "02 Track.flac")
+
+    conn = db.get_connection(tmp_path / "test.db")
+    try:
+        # Insert loudness rows only (no indexed_files entry) to simulate
+        # the state after a previous prune already cleaned the index but
+        # left orphan loudness rows behind.
+        album_str = str(album_dir.resolve())
+        for track in (t1, t2):
+            db.upsert_track(
+                conn,
+                path=str(track.resolve()),
+                integrated_lufs=-14.0,
+                true_peak_dbtp=-1.0,
+                lra=6.0,
+                duration_sec=180.0,
+                album_path=album_str,
+                analyzed_at="2026-05-06T00:00:00+00:00",
+                file_mtime=track.stat().st_mtime,
+            )
+        db.upsert_album(
+            conn,
+            path=album_str,
+            integrated_lufs=-14.0,
+            true_peak_dbtp=-1.0,
+            lra=6.0,
+            track_count=2,
+            duration_sec=360.0,
+            analyzed_at="2026-05-06T00:00:00+00:00",
+        )
+        conn.commit()
+
+        # Remove both files from disk (simulating out-of-band quarantine)
+        t1.unlink()
+        t2.unlink()
+
+        root_str = str(root.resolve()) + "/"
+        counts = db.prune_missing(conn, root_str)
+        assert counts.get("track_loudness", 0) == 2
+        assert counts.get("album_loudness", 0) == 1
+        assert conn.execute("SELECT COUNT(*) FROM track_loudness").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM album_loudness").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_prune_removes_orphan_album_loudness_no_tracks(tmp_path: Path) -> None:
+    """album_loudness row for a directory that no longer exists is pruned
+    even when no track_loudness rows reference it."""
+    root = tmp_path / "lib"
+    album_dir = root / "Artist" / "Album (2020)"
+    album_dir.mkdir(parents=True)
+
+    conn = db.get_connection(tmp_path / "test.db")
+    try:
+        album_str = str(album_dir.resolve())
+        db.upsert_album(
+            conn,
+            path=album_str,
+            integrated_lufs=-14.0,
+            true_peak_dbtp=-1.0,
+            lra=6.0,
+            track_count=0,
+            duration_sec=0.0,
+            analyzed_at="2026-05-06T00:00:00+00:00",
+        )
+        conn.commit()
+
+        # Remove the directory
+        album_dir.rmdir()
+
+        root_str = str(root.resolve()) + "/"
+        counts = db.prune_missing(conn, root_str)
+        assert counts.get("album_loudness", 0) == 1
+        assert conn.execute("SELECT COUNT(*) FROM album_loudness").fetchone()[0] == 0
     finally:
         conn.close()
 

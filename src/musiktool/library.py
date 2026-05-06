@@ -28,6 +28,7 @@ OUTPUT_FORMATS = {"text", "json", "ndjson"}
 SEVERITIES = {"info": 0, "warning": 1, "error": 2}
 _SEVERITY_ICONS = {"error": "\u2717", "warning": "\u26a0", "info": "\u2139"}
 FIX_PLAN_ACTIONS = {
+    "classify",
     "copy_album_dir",
     "copy_file",
     "ignore_finding",
@@ -122,6 +123,34 @@ MEDIA_KIND_SUBTREES: dict[str, str] = {
     "podcast": "podcasts",
 }
 _MEDIA_KIND_MIN_CONFIDENCE = 0.9
+
+# Genre substring → (media_kind, confidence).  Checked in order; first match wins.
+_GENRE_CLASSIFICATION_RULES: list[tuple[str, str, float]] = [
+    ("Podcast", "podcast", 0.85),
+    ("Audiobook", "audiobook", 0.85),
+    ("Hörbuch", "audiobook", 0.85),
+    ("Books & Spoken", "audiobook", 0.85),
+    ("Hörspiel", "radio", 0.80),
+    ("Radio Drama", "radio", 0.80),
+    ("Comedy", "radio", 0.80),
+    ("Radio", "radio", 0.80),
+]
+
+
+def _classify_genre(genre: str) -> tuple[str, float] | None:
+    """Return (media_kind, confidence) for a genre string, or None for music."""
+    genre_lower = genre.lower()
+    for pattern, media_kind, confidence in _GENRE_CLASSIFICATION_RULES:
+        if pattern.lower() in genre_lower:
+            return media_kind, confidence
+    return None
+
+
+def _dominant_genre(genre_counts: dict[str, int]) -> str:
+    """Return the most common genre as a quoted string."""
+    top = max(genre_counts, key=lambda k: genre_counts[k])
+    return f"'{top}'"
+
 
 AUXILIARY_SUFFIXES = {
     ".cue",
@@ -780,8 +809,11 @@ def apply_plan(
     for action, warnings, skipped in validated_actions:
         db_updates = None
         if not dry_run and not skipped:
-            _execute_action(action)
-            db_updates = _relocate_action_paths(action, db_conn)
+            if action["type"] == "classify":
+                db_updates = _execute_classify_action(action, db_conn)
+            else:
+                _execute_action(action)
+                db_updates = _relocate_action_paths(action, db_conn)
         if skipped:
             status = "skipped"
         elif dry_run and action["type"] == "ignore_finding":
@@ -794,7 +826,7 @@ def apply_plan(
             action_id=action["action_id"],
             type=action["type"],
             status=status,
-            source=action.get("source"),
+            source=action.get("source") or action.get("subject_path"),
             destination=action.get("destination"),
             reason=action.get("reason"),
             db_updates=db_updates if db_updates else None,
@@ -1004,6 +1036,128 @@ def propose_media_kind_folders(
         generated_at=_now(),
         generated_by="musiktool propose media-kind-folders",
         proposal_type="media-kind-folders",
+        actions=actions,
+        skipped=skipped,
+    )
+
+
+def propose_classify(
+    path: Path,
+    *,
+    conn: sqlite3.Connection,
+    excludes: list[str] | None = None,
+) -> ProposeResult:
+    """Generate classify actions from indexed genre tags."""
+    root = path.resolve()
+    if not root.exists():
+        raise PathNotFoundError(f"path does not exist: {root}")
+
+    ignore_policy = load_ignore_policy(root, excludes=excludes)
+    album_dirs = _discover_album_dirs(root, ignore_policy)
+
+    actions: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for album_dir in album_dirs:
+        album_path_str = str(album_dir)
+
+        # Skip if manually classified at album or artist level (not library root).
+        existing = db.get_effective_library_classification(conn, album_path_str)
+        if (
+            existing is not None
+            and existing["source"] == "manual"
+            and existing["subject_path"] != str(root)
+        ):
+            skipped.append({
+                "path": album_path_str,
+                "reason": "already_classified",
+                "media_kind": existing["media_kind"],
+                "source": existing["source"],
+            })
+            continue
+
+        # Collect genre tags from indexed tracks in this album.
+        tag_rows = db.get_tag_facts_under(conn, album_path_str)
+        genres = [row["genre"] for row in tag_rows if row["genre"]]
+        if not genres:
+            skipped.append({
+                "path": album_path_str,
+                "reason": "no_genre_data",
+                "track_count": len(tag_rows),
+            })
+            continue
+
+        # Classify each genre and accumulate votes by media_kind.
+        kind_votes: dict[str, list[tuple[str, float]]] = {}
+        for genre in genres:
+            result = _classify_genre(genre)
+            if result is not None:
+                mk, conf = result
+                kind_votes.setdefault(mk, []).append((genre, conf))
+
+        if not kind_votes:
+            # All genres map to music (default) — no action needed.
+            skipped.append({
+                "path": album_path_str,
+                "reason": "already_default",
+                "genres": sorted(set(genres)),
+            })
+            continue
+
+        if len(kind_votes) > 1:
+            # Multiple non-music kinds detected — ambiguous.
+            skipped.append({
+                "path": album_path_str,
+                "reason": "ambiguous_genre",
+                "kind_votes": {k: len(v) for k, v in kind_votes.items()},
+                "genres": sorted(set(genres)),
+            })
+            continue
+
+        # Single non-music kind — propose classification.
+        media_kind = next(iter(kind_votes))
+        votes = kind_votes[media_kind]
+        confidence = max(conf for _, conf in votes)
+        genre_counts: dict[str, int] = {}
+        for genre, _ in votes:
+            genre_counts[genre] = genre_counts.get(genre, 0) + 1
+
+        # Skip if existing automatic classification already matches.
+        if (
+            existing is not None
+            and existing["media_kind"] == media_kind
+            and existing["source"] == "genre"
+        ):
+            skipped.append({
+                "path": album_path_str,
+                "reason": "already_classified",
+                "media_kind": media_kind,
+                "source": "genre",
+            })
+            continue
+
+        actions.append({
+            "action_id": f"classify:{len(actions) + 1}",
+            "type": "classify",
+            "because_finding": "classification.genre_heuristic",
+            "subject_path": album_path_str,
+            "media_kind": media_kind,
+            "confidence": confidence,
+            "reason": (
+                f"Genre {_dominant_genre(genre_counts)} suggests {media_kind}"
+            ),
+            "evidence": {
+                "genre_counts": genre_counts,
+                "track_count": len(tag_rows),
+                "tracks_with_genre": len(genres),
+            },
+        })
+
+    return ProposeResult(
+        library_root=str(root),
+        generated_at=_now(),
+        generated_by="musiktool propose classify",
+        proposal_type="classify",
         actions=actions,
         skipped=skipped,
     )
@@ -1330,13 +1484,34 @@ def format_propose(result: ProposeResult, output_format: str = "text") -> str:
         return "\n".join(lines) + "\n"
 
     root = result.library_root
-    verb = "move" if result.proposal_type == "media-kind-folders" else "rename"
+    if result.proposal_type == "media-kind-folders":
+        verb = "move"
+    elif result.proposal_type == "classify":
+        verb = "classification"
+    else:
+        verb = "rename"
     lines = [
         f"Propose: {result.proposal_type} "
         f"({len(result.actions)} {verb}(s), {len(result.skipped)} skipped)",
         "",
     ]
     for action in result.actions:
+        if action["type"] == "classify":
+            subject = action["subject_path"]
+            try:
+                subj_rel = str(Path(subject).relative_to(root))
+            except ValueError:
+                subj_rel = subject
+            mk = action["media_kind"]
+            conf = action["confidence"]
+            evidence = action.get("evidence", {})
+            genre_counts = evidence.get("genre_counts", {})
+            genre_str = ", ".join(
+                f"{g} ({n})"
+                for g, n in sorted(genre_counts.items(), key=lambda x: -x[1])
+            )
+            lines.append(f"  {subj_rel}  \u2192  {mk} ({conf:.0%}, {genre_str})")
+            continue
         source = action["source"]
         destination = action["destination"]
         try:
@@ -2481,7 +2656,7 @@ def _validate_path_move_conflicts(actions: Any) -> None:
     moves: list[tuple[str, Path, Path]] = []
     destinations: dict[str, str] = {}
     for action in actions:
-        if action["type"] in {"ignore_finding", "write_tags"}:
+        if action["type"] in {"classify", "ignore_finding", "write_tags"}:
             continue
         source = Path(action["source"])
         destination = Path(action["destination"])
@@ -2585,6 +2760,30 @@ def _validate_action(
         action["tags"] = tags
         return action
 
+    if action_type == "classify":
+        subject_value = raw_action.get("subject_path")
+        if not isinstance(subject_value, str) or not subject_value:
+            raise ValidationError(f"action {index} classify requires subject_path")
+        subject = Path(subject_value).resolve(strict=False)
+        _validate_inside(subject, library_root, f"action {index} subject_path")
+        media_kind = raw_action.get("media_kind")
+        if media_kind not in MEDIA_PROFILES:
+            raise ValidationError(
+                f"action {index} classify has invalid media_kind: {media_kind}"
+            )
+        confidence = raw_action.get("confidence")
+        if not isinstance(confidence, (int, float)) or not (0.0 <= confidence <= 1.0):
+            raise ValidationError(
+                f"action {index} classify requires confidence between 0.0 and 1.0"
+            )
+        action["subject_path"] = str(subject)
+        action["media_kind"] = media_kind
+        action["confidence"] = float(confidence)
+        evidence = raw_action.get("evidence")
+        if evidence is not None:
+            action["evidence"] = evidence
+        return action
+
     source_value = raw_action.get("source")
     if not isinstance(source_value, str) or not source_value:
         raise ValidationError(f"action {index} requires source")
@@ -2630,6 +2829,8 @@ def _execute_action(action: dict[str, Any]) -> None:
         for path in action["paths"]:
             write_tags(path, tags)
         return
+    if action_type == "classify":
+        return  # DB-only — handled by _execute_classify_action in apply_plan
 
     source = Path(action["source"])
     destination = Path(action["destination"])
@@ -2643,6 +2844,29 @@ def _execute_action(action: dict[str, Any]) -> None:
     shutil.move(str(source), str(destination))
 
 
+def _execute_classify_action(
+    action: dict[str, Any],
+    conn: sqlite3.Connection | None,
+) -> dict[str, int] | None:
+    """Write a library classification from a classify action."""
+    if conn is None:
+        raise ValidationError(
+            f"classify action {action['action_id']} requires a database connection"
+        )
+    from datetime import datetime, timezone
+
+    db.upsert_library_classification(
+        conn,
+        subject_path=action["subject_path"],
+        media_kind=action["media_kind"],
+        source="genre",
+        confidence=action["confidence"],
+        confirmed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    conn.commit()
+    return {"library_classification": 1}
+
+
 def _relocate_action_paths(
     action: dict[str, Any],
     conn: sqlite3.Connection | None,
@@ -2650,7 +2874,7 @@ def _relocate_action_paths(
     """Update DB path references after a filesystem move."""
     if conn is None:
         return None
-    if action["type"] in {"ignore_finding", "write_tags", "copy_file", "copy_album_dir"}:
+    if action["type"] in {"classify", "ignore_finding", "write_tags", "copy_file", "copy_album_dir"}:
         return None
     source = action.get("source")
     destination = action.get("destination")
@@ -2666,7 +2890,7 @@ def _action_warnings(
 ) -> list[str]:
     """Check for potential problems with an action."""
     warnings: list[str] = []
-    if action["type"] in {"ignore_finding", "write_tags"}:
+    if action["type"] in {"classify", "ignore_finding", "write_tags"}:
         return warnings
 
     destination = action.get("destination")

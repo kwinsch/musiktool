@@ -6,7 +6,20 @@ fix plans. The human reviews and approves.
 
 ## Workflow Sequence
 
-### 0. Ensure the index is current
+### 0. Orient: what are we working with?
+
+```bash
+musiktool stats <library>
+musiktool stats <library> --format json
+```
+
+Run `stats` first to understand the library before touching anything: file
+counts, format histogram, total size, tag coverage, media-kind breakdown,
+index coverage, and loudness coverage. This tells the agent whether the
+index is populated, how many albums lack years, what codecs dominate, and
+whether loudness data exists for tape work.
+
+### 0bis. Ensure the index is current
 
 ```bash
 musiktool index scan <library> --hash --fingerprint
@@ -23,6 +36,19 @@ into the analytics DB. Without this:
 
 The scan is incremental: unchanged files are skipped on subsequent runs.
 
+**Always pass both `--hash` and `--fingerprint`.** If stale files are
+re-indexed with only `--hash`, their existing Chromaprint fingerprints are
+lost and fingerprint coverage silently drops. The two flags are cheap
+relative to a full rescan and should always be used together.
+
+**Hash terminology.** The index stores two distinct hashes in different
+tables. `indexed_files.blake3` is the file-level identity hash (populated
+by `--hash`) — it hashes the raw file bytes and detects exact duplicates
+across formats. `audio_facts.audio_hash` is a schema placeholder for a
+future decoded-PCM content hash — it is never populated by any current
+command. When the docs or agent output say "hash," they mean BLAKE3 file
+hash unless explicitly stated otherwise.
+
 ### 1. Mechanical fixes
 
 ```bash
@@ -37,6 +63,27 @@ supported: `year-folders` (adds `(Year)` to album directories using consensus
 tag year) and `media-kind-folders` (moves classified albums into `music/`,
 `radio/`, `audiobooks/`, or `podcasts/`). Review the plan, then pipe to
 `apply`.
+
+#### Handling `no_consensus_year`
+
+`propose year-folders` skips albums where `_consensus_year()` returns None,
+reporting `"reason": "no_consensus_year"`. This means the tracks in the album
+do not unanimously agree on a single year. Common causes:
+
+- **Disc-split years**: A multi-disc compilation where disc 1 tags say 1998
+  and disc 2 tags say 1997. The album release year is one specific date, but
+  the per-disc tags reflect original release years of the compiled material.
+- **Partially tagged**: Some tracks have a year tag, others are missing it
+  entirely.
+- **All null**: No tracks have year tags at all.
+
+What the agent should do:
+
+1. `musiktool inspect <album_path> --format json` — check the `tags` section
+   to see which years are present and how they split.
+2. Look up the album release year (MusicBrainz, Discogs, or agent knowledge).
+3. Either write consistent year tags via a `write_tags` plan, or manually
+   rename the album directory with the correct `(Year)` suffix.
 
 ### 2. Classify media kinds
 
@@ -63,6 +110,28 @@ musiktool audit <library> --format json --severity warning
 
 Reports structured findings with evidence dictionaries, confidence scores,
 and suggested actions. The agent reads these and decides what to fix.
+
+#### Comparing against a curated library
+
+Use `--against` to check a staging area, quarantine, or import source against
+an existing curated library for duplicates:
+
+```bash
+musiktool audit <staging_path> --against <curated_library> --format json
+```
+
+This detects `duplicates.source_already_curated` findings — albums in the
+staging area that already exist in the curated library (by hash, fingerprint,
+or strong metadata match). Useful before importing from iTunes, incoming, or
+any external source.
+
+#### Disc-track filename patterns
+
+Audit reports `tracks.filename_pattern` (severity: info) for filenames that
+don't match `NN Title.ext`. In multi-disc albums, the expected format is
+`D-NN Title.ext` (e.g. `1-01 Title.flac`). This disc-track naming is
+correct and should not be "fixed" — the agent should leave these as-is.
+A future `propose --type filenames` will handle this pattern explicitly.
 
 ### 4. Inspect before acting
 
@@ -105,6 +174,29 @@ musiktool apply plan.json --execute
 ```
 
 Only after human approval. The agent should never execute without confirmation.
+
+### 8. Post-curation: loudness analysis
+
+```bash
+musiktool analyze <library>
+musiktool analyze <library> --index --hash-index --fingerprint-index
+```
+
+Run `analyze` after curation is complete. This populates the loudness DB
+(`track_loudness`, `album_loudness`) with EBU R128 measurements — required
+for tape mastering and useful for library health overview. The scan is
+incremental (skips tracks whose mtime hasn't changed). Pass `--index` to
+also refresh the file index during the same walk.
+
+After bulk moves or quarantine operations, stale loudness rows for removed
+paths may linger. Clean them up:
+
+```bash
+musiktool index prune <library> --execute
+```
+
+`prune` removes DB rows (index, loudness, classifications) for paths that
+no longer exist on disk.
 
 ## Decision Boundary
 
@@ -218,6 +310,8 @@ Agent:
 Human: "Organize this 1TB of mixed audio"
 
 Agent:
+  0. musiktool stats /dump
+     → orient: file counts, formats, tag coverage, size
   1. musiktool index scan /dump --hash --fingerprint
      → builds file index with hashes, fingerprints, tags
   2. musiktool audit /dump --format json
@@ -241,6 +335,10 @@ Agent:
      - quarantine for confirmed duplicates
      - rename_album_dir for canonical name corrections
   9. musiktool apply final-plan.json --execute
+ 10. musiktool analyze /dump
+     → populates loudness DB for tape mastering and health overview
+ 11. musiktool index prune /dump --execute
+     → cleans up stale DB rows for quarantined/removed files
 ```
 
 The agent adds value by applying music knowledge that no rule engine has:

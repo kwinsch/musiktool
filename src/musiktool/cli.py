@@ -486,7 +486,7 @@ def apply_cmd(
 @app.command()
 def propose(
     path: Path = typer.Argument(..., help="Library root path"),
-    proposal_type: str = typer.Option(..., "--type", help="Proposal type: year-folders, media-kind-folders"),
+    proposal_type: str = typer.Option(..., "--type", help="Proposal type: year-folders, media-kind-folders, classify"),
     output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
     db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
     use_index: bool = typer.Option(True, "--index/--no-index", help="Use current index facts when available"),
@@ -498,11 +498,12 @@ def propose(
     from musiktool import db
     from musiktool.library import (
         format_propose,
+        propose_classify,
         propose_media_kind_folders,
         propose_year_folders,
     )
 
-    if proposal_type not in ("year-folders", "media-kind-folders"):
+    if proposal_type not in ("year-folders", "media-kind-folders", "classify"):
         raise ValidationError(f"unknown proposal type: {proposal_type}")
 
     conn = None
@@ -521,9 +522,9 @@ def propose(
             except (OSError, sqlite3.Error):
                 conn = None
 
-    if proposal_type == "media-kind-folders" and conn is None:
+    if proposal_type in ("media-kind-folders", "classify") and conn is None:
         raise ValidationError(
-            "media-kind-folders requires a library index database "
+            f"{proposal_type} requires a library index database "
             "(run 'musiktool index scan' first)"
         )
 
@@ -534,9 +535,16 @@ def propose(
                 index_conn=conn,
                 excludes=exclude,
             )
-        else:
+        elif proposal_type == "media-kind-folders":
             assert conn is not None
             result = propose_media_kind_folders(
+                path,
+                conn=conn,
+                excludes=exclude,
+            )
+        else:
+            assert conn is not None
+            result = propose_classify(
                 path,
                 conn=conn,
                 excludes=exclude,
@@ -960,21 +968,39 @@ def index_prune_cmd(
                 (root_str,),
             ).fetchall()
             missing_files = [row[0] for row in rows if not Path(row[0]).exists()]
+            loudness_rows = conn.execute(
+                "SELECT path FROM track_loudness WHERE path LIKE ? || '%'",
+                (root_str,),
+            ).fetchall()
+            orphan_loudness = [
+                row[0] for row in loudness_rows if not Path(row[0]).exists()
+            ]
+            album_rows = conn.execute(
+                "SELECT path FROM album_loudness WHERE path LIKE ? || '%'",
+                (root_str,),
+            ).fetchall()
+            orphan_albums = [
+                row[0] for row in album_rows if not Path(row[0]).exists()
+            ]
             class_rows = conn.execute(
                 "SELECT subject_path FROM library_classification WHERE subject_path LIKE ? || '%'",
                 (root_str,),
             ).fetchall()
             missing_class = [row[0] for row in class_rows if not Path(row[0]).exists()]
-            total_missing = len(missing_files) + len(missing_class)
+            total_missing = len(missing_files) + len(orphan_loudness) + len(orphan_albums) + len(missing_class)
             if not total_missing:
                 typer.echo("No stale entries found.")
                 return
             typer.echo(f"[DRY RUN] {total_missing} stale entries would be pruned:")
             if missing_files:
                 typer.echo(f"  indexed files: {len(missing_files)}")
+            if orphan_loudness:
+                typer.echo(f"  track loudness: {len(orphan_loudness)}")
+            if orphan_albums:
+                typer.echo(f"  album loudness: {len(orphan_albums)}")
             if missing_class:
                 typer.echo(f"  classifications: {len(missing_class)}")
-            all_missing = sorted(set(missing_files + missing_class))
+            all_missing = sorted(set(missing_files + orphan_loudness + orphan_albums + missing_class))
             for p in all_missing[:20]:
                 typer.echo(f"  {p}")
             if len(all_missing) > 20:

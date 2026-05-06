@@ -406,6 +406,16 @@ def get_tag_facts(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def get_tag_facts_under(
+    conn: sqlite3.Connection, directory: str,
+) -> list[sqlite3.Row]:
+    """Return tag_facts rows for all files under a directory prefix."""
+    return conn.execute(
+        "SELECT * FROM tag_facts WHERE path LIKE ? || '/%'",
+        (directory,),
+    ).fetchall()
+
+
 def upsert_tag_facts(
     conn: sqlite3.Connection,
     *,
@@ -518,15 +528,19 @@ def index_stats(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def prune_missing(conn: sqlite3.Connection, root: str) -> dict[str, int]:
-    """Remove index entries for paths that no longer exist on disk.
+    """Remove DB entries for paths that no longer exist on disk.
 
-    Checks indexed_files and library_classification under *root*, deletes
-    rows from all related tables where the path no longer exists on the
-    filesystem. Returns count of pruned rows per table.
+    Scans indexed_files, track_loudness, album_loudness, and
+    library_classification under *root*. Deletes rows from all related
+    tables where the referenced path no longer exists on the filesystem.
+    Returns count of pruned rows per table.
+
+    This catches orphan rows left by out-of-band moves (manual quarantine,
+    ``mv``) that bypass ``apply --execute`` path cascading.
     """
     counts: dict[str, int] = {}
 
-    # Prune file-level tables
+    # --- Prune file-level index tables ---
     rows = conn.execute(
         "SELECT path FROM indexed_files WHERE path LIKE ? || '%'",
         (root,),
@@ -549,22 +563,51 @@ def prune_missing(conn: sqlite3.Connection, root: str) -> dict[str, int]:
                 if cursor.rowcount > 0:
                     counts[table] = counts.get(table, 0) + cursor.rowcount
 
-        # Prune album_loudness for albums with no remaining tracks
-        album_paths = {str(Path(p).parent) for p in missing_files}
-        for album_path in album_paths:
-            remaining = conn.execute(
-                "SELECT COUNT(*) FROM track_loudness WHERE album_path = ?",
-                (album_path,),
-            ).fetchone()[0]
-            if remaining == 0:
-                cursor = conn.execute(
-                    "DELETE FROM album_loudness WHERE path = ?",
-                    (album_path,),
-                )
-                if cursor.rowcount > 0:
-                    counts["album_loudness"] = counts.get("album_loudness", 0) + cursor.rowcount
+    # --- Prune orphan track_loudness rows not covered by indexed_files ---
+    loudness_rows = conn.execute(
+        "SELECT path FROM track_loudness WHERE path LIKE ? || '%'",
+        (root,),
+    ).fetchall()
+    orphan_tracks = [
+        row[0] for row in loudness_rows if not Path(row[0]).exists()
+    ]
+    for path in orphan_tracks:
+        cursor = conn.execute(
+            "DELETE FROM track_loudness WHERE path = ?", (path,),
+        )
+        if cursor.rowcount > 0:
+            counts["track_loudness"] = counts.get("track_loudness", 0) + cursor.rowcount
 
-    # Prune library_classification for paths that no longer exist
+    # --- Prune album_loudness for albums with no remaining tracks or
+    #     whose directory no longer exists ---
+    # Collect candidate album paths from both sources
+    album_candidates: set[str] = set()
+    for path in missing_files:
+        album_candidates.add(str(Path(path).parent))
+    for path in orphan_tracks:
+        album_candidates.add(str(Path(path).parent))
+    # Also scan album_loudness directly for missing directories
+    album_rows = conn.execute(
+        "SELECT path FROM album_loudness WHERE path LIKE ? || '%'",
+        (root,),
+    ).fetchall()
+    for row in album_rows:
+        if not Path(row[0]).exists():
+            album_candidates.add(row[0])
+    for album_path in album_candidates:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM track_loudness WHERE album_path = ?",
+            (album_path,),
+        ).fetchone()[0]
+        if remaining == 0:
+            cursor = conn.execute(
+                "DELETE FROM album_loudness WHERE path = ?",
+                (album_path,),
+            )
+            if cursor.rowcount > 0:
+                counts["album_loudness"] = counts.get("album_loudness", 0) + cursor.rowcount
+
+    # --- Prune library_classification for paths that no longer exist ---
     class_rows = conn.execute(
         "SELECT subject_path FROM library_classification WHERE subject_path LIKE ? || '%'",
         (root,),
