@@ -165,3 +165,4 @@ musiktool tape render "Friday Mix" -o ~/tape-projects/output
 - `docs/tape_recording_reference.md` — cassette, reel, VHS technical reference
 - `docs/disc_recording_reference.md` — CD, MiniDisc technical reference
 - `docs/vinyl_recording_reference.md` — vinyl mastering reference
+- `docs/pipewire-airplay-sonos.md` — streaming to AirPlay speakers (Sonos, HomePod)
