@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from musiktool import db
-from musiktool.constants import MEDIUM_PRESETS, TRANSPARENT_LIMITING_BUDGET_DB
+from musiktool.constants import MEDIUM_PRESETS
+from musiktool.loudness import compute_gain, compute_gain_with_limiter
 from musiktool.exceptions import (
     AudioReadError,
     InvalidMediumError,
@@ -1101,7 +1102,6 @@ def assign_sides(
 
 # --- Tape analysis ---
 
-PEAK_CEILING_DBTP = 0.0
 LUFS_SPREAD_WARNING_THRESHOLD = 10.0  # dB
 
 
@@ -1189,60 +1189,6 @@ def _resolve_sample_rate(
     return min(candidates)  # prefer lower rate on tie
 
 
-def _compute_gain(
-    measured_lufs: float,
-    true_peak_dbtp: float,
-    target_lufs: float,
-    peak_ceiling_dbtp: float = PEAK_CEILING_DBTP,
-    limiting_budget_db: float = TRANSPARENT_LIMITING_BUDGET_DB,
-) -> tuple[float, float, bool, float]:
-    """Compute gain with bounded peak limiting.
-
-    The limiting budget determines how many dB of peak limiting is acceptable
-    to reach (or approach) target LUFS. Gain is applied up to
-    max_safe_gain + budget, with the limiter catching the excess peaks.
-
-    Returns (gain_db, peak_after_gain, needs_limiter, limiter_penalty_db).
-    - gain_db: actual gain applied
-    - peak_after_gain: true peak after gain (before limiter)
-    - needs_limiter: True if gain pushes peaks above ceiling
-    - limiter_penalty_db: how much quieter than target due to budget exhaustion
-    """
-    desired_gain = target_lufs - measured_lufs
-    max_safe_gain = peak_ceiling_dbtp - true_peak_dbtp
-
-    if desired_gain <= max_safe_gain:
-        return desired_gain, true_peak_dbtp + desired_gain, False, 0.0
-
-    # Peaks prevent reaching target. Apply gain up to budget.
-    gain = min(desired_gain, max_safe_gain + limiting_budget_db)
-    peak_after = true_peak_dbtp + gain
-    penalty = desired_gain - gain
-    needs_limiter = gain > max_safe_gain
-    return gain, peak_after, needs_limiter, penalty
-
-
-def _compute_gain_with_limiter(
-    measured_lufs: float,
-    true_peak_dbtp: float,
-    target_lufs: float,
-    peak_ceiling_dbtp: float = PEAK_CEILING_DBTP,
-    use_limiter: bool = False,
-) -> tuple[float, float, bool, float]:
-    """Compute gain with optional unlimited limiting budget.
-
-    When use_limiter is False: uses TRANSPARENT_LIMITING_BUDGET_DB (3 dB).
-    When use_limiter is True: unlimited budget (full desired gain applied).
-
-    Returns (gain_db, peak_after_gain, needs_limiter, limiter_penalty_db).
-    """
-    budget = float("inf") if use_limiter else TRANSPARENT_LIMITING_BUDGET_DB
-    return _compute_gain(
-        measured_lufs, true_peak_dbtp, target_lufs, peak_ceiling_dbtp,
-        limiting_budget_db=budget,
-    )
-
-
 def _compute_compressor_params(
     lra: float,
     medium_dynamic_range_db: float,
@@ -1312,7 +1258,7 @@ def analyze_project(
         if it.lra is None:
             raise MissingLoudnessError(f"missing LRA data for: {it.path}")
 
-        gain, peak_after, needs_limiter, penalty = _compute_gain_with_limiter(
+        gain, peak_after, needs_limiter, penalty = compute_gain_with_limiter(
             it.lufs, it.peak, target, project["peak_ceiling_dbtp"],
             use_limiter=user_limiter,
         )

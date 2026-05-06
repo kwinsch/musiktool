@@ -5,6 +5,7 @@
 ```
 musiktool audit <path> [options]
 musiktool inspect <path> [options]
+musiktool stats <path> [options]
 musiktool apply <plan.json> [options]
 ```
 
@@ -82,15 +83,16 @@ lib/
         YYYY-MM-DD Episode Title.ext
 ```
 
-The initial `audit` implementation still applies the music profile by default.
-Future profile support should expose this explicitly:
+The `--profile` option controls which checks apply. Use `auto` (default) to
+resolve the profile from the index classification for each album, falling back
+to `music` when no classification exists:
 
 ```
+musiktool audit ~/Music/lib --profile auto              # default
 musiktool audit ~/Music/lib/music --profile music
 musiktool audit ~/Music/lib/radio --profile radio
 musiktool audit ~/Music/lib/audiobooks --profile audiobook
 musiktool audit ~/Music/lib/podcasts --profile podcast
-musiktool audit ~/Music/lib --profile auto
 ```
 
 ### Profile Rules
@@ -177,7 +179,7 @@ musiktool audit <path> [options]
 | `--sidecar-root` | default sidecar root | Out-of-tree sidecar root for index refresh. |
 | `--exclude` | repeatable | Additional gitignore-style pattern to exclude. |
 | `--similarity-threshold` | `0.08` | Chromaprint BER threshold for audio duplicate detection. Lower = stricter (0.0 = exact only, 0.01 = codec transcodes, 0.08 = default, 0.15 = catches remasters). |
-| `--profile` | `music` | Planned option: audit profile, one of `music`, `radio`, `audiobook`, `podcast`, or `auto`. |
+| `--profile` | `auto` | Audit profile: `music`, `radio`, `audiobook`, `podcast`, or `auto` (resolves per-album from index classification). |
 
 **Checks:**
 
@@ -235,6 +237,7 @@ musiktool index scan <path> [options]
 musiktool index rebuild <path> [options]
 musiktool index status [options]
 musiktool index classify <path> <media-kind> [options]
+musiktool index prune <path> [options]
 ```
 
 `scan` refreshes stale or missing facts. `rebuild` forces a live rescan and
@@ -244,6 +247,45 @@ rewrites sidecars. Both commands accept `--hash`, `--fingerprint`,
 `classify` stores a confirmed media kind: `music`, `radio`, `audiobook`, or
 `podcast`. Directory classifications inherit to descendants; a more specific
 manual classification on a child path overrides its parent.
+
+The index stores audio facts only: file identity, tag facts, stream facts,
+hashes, fingerprints, and media-kind classifications for audio paths. Album
+side files such as CUE sheets, EAC/rip logs, artwork, booklets, playlists, and
+artist extras are preserved by album-directory moves and inventoried by
+`stats`; they are not inserted into `indexed_files`.
+
+`prune` removes DB rows for indexed paths that no longer exist on disk. It is
+a stale-reference cleanup tool, not an audit substitute; files whose mtime has
+changed are reported as stale by `audit`/`stats` and should be refreshed with
+`index scan`.
+
+### stats
+
+Show a structured overview of a library path.
+
+```
+musiktool stats <path> [options]
+```
+
+**Options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `--format` | `text` | Output format: `text`, `json`, or `ndjson`. |
+| `--db` | default DB | Optional index DB path. |
+| `--index` / `--no-index` | `--index` | Enrich filesystem counts with current index facts when available. |
+| `--exclude` | repeatable | Additional gitignore-style pattern to exclude. |
+
+`stats` walks the active filesystem view first, respecting `.musiktoolignore`,
+built-in ignores such as `_quarantine/`, and CLI excludes. It then enriches
+those same active audio paths from the DB. This avoids raw DB row totals leaking
+quarantined or stale entries into active-library counts.
+
+Output includes album/track counts, total/audio/side-file sizes, audio format
+histograms, side-file histograms (`cue_sheet`, `rip_log`, `image`, `booklet`,
+`playlist`, `text`, `other`), provenance coverage for profiles that expect it,
+tag coverage, album-level media-profile counts, index coverage
+(`current`/`stale`/`missing`), and loudness coverage.
 
 ### inspect
 
@@ -293,14 +335,20 @@ musiktool apply <plan.json> [options]
 | `--execute` | off | Apply the validated plan. Mutually exclusive with `--dry-run`. |
 | `--format` | `text` | Output format: `text`, `json`, or `ndjson`. |
 | `--quarantine-dir` | `<root>/_quarantine` | Destination for quarantine actions. |
+| `--skip` | repeatable | Skip action IDs without editing the plan JSON. |
 
 **Safety model:**
 
 - `apply` only accepts whitelisted action types.
 - Every action must reference an audit `finding_id` unless explicitly marked
   as a manual action.
+- On execute, the complete plan is validated before the first filesystem
+  mutation.
 - Destination paths must stay inside the library root or configured quarantine
   directory.
+- Copy actions may read from explicit `source_roots` in the plan, but still
+  write only inside the library root.
+- Overlapping parent/child move plans are rejected before execution.
 - Existing CUE sheets and EAC logs are never deleted by rename or cleanup
   actions.
 - Destructive deletion is not a first-class action. Use `quarantine`.
@@ -323,7 +371,7 @@ musiktool propose <path> --type <proposal-type> [options]
 
 | Option | Default | Description |
 |---|---|---|
-| `--type` | *(required)* | Proposal type. Currently: `year-folders`. |
+| `--type` | *(required)* | Proposal type. Currently: `year-folders`, `media-kind-folders`. |
 | `--format` | `text` | Output format: `text`, `json`, or `ndjson`. |
 | `--db` | default DB | Optional index DB path. |
 | `--index` / `--no-index` | `--index` | Use current indexed facts when available. |
@@ -334,6 +382,7 @@ musiktool propose <path> --type <proposal-type> [options]
 | Type | Actions | Logic |
 |---|---|---|
 | `year-folders` | `rename_album_dir` | Adds `(Year)` to album directories using consensus tag year. Skips albums where tracks disagree on year or destination already exists. |
+| `media-kind-folders` | `rename_album_dir` | Moves album directories into `music/`, `radio/`, `audiobooks/`, or `podcasts/` based on confirmed/effective media-kind classification. |
 
 **Boundary:** `propose` only handles operations where there is exactly one
 correct answer. Naming corrections (e.g. "Black Album" → "Metallica"),
@@ -366,6 +415,33 @@ Propose: year-folders (3 rename(s), 0 skipped)
 
 Pipe JSON to apply:
   musiktool propose <path> --type year-folders --format json | musiktool apply - --execute
+```
+
+### itunes
+
+Read an old iTunes XML library and generate copy-only import plans. The iTunes
+source is never moved or modified.
+
+```
+musiktool itunes scan <itunes-root> [--format text|json|ndjson]
+musiktool itunes albums <itunes-root> [--artist NAME] [--album TITLE] [--limit N]
+musiktool itunes propose <itunes-root> --target <library-root>
+                       (--artist NAME | --album TITLE)
+                       [--include-protected] [--format text|json|ndjson]
+```
+
+`scan` summarizes the XML catalog and remaps legacy `file://localhost/Volumes/...`
+locations to files under the selected iTunes root. `albums` lists matching music
+albums for review. `propose` emits `copy_file` actions that can be dry-run with
+`apply`; DRM-era protected AAC files (`.m4p` / "Protected AAC") are skipped by
+default and only included with `--include-protected`.
+
+Example:
+
+```
+musiktool itunes albums ~/Music/iTunes --artist Rammstein
+musiktool itunes propose ~/Music/iTunes --target ~/Music/lib --artist Rammstein \
+  --format json | musiktool apply -
 ```
 
 ## JSON SCHEMA
@@ -481,6 +557,8 @@ Agents produce fix plans. `musiktool apply` validates and executes them.
 | `rename_album_dir` | Rename an album directory, usually to add or correct `(Year)`. |
 | `rename_track_file` | Rename a track file to match `NN Title.ext`. |
 | `move_file` | Move an allowed file within the library root. |
+| `copy_file` | Copy one source file from `source_roots` into the library root. |
+| `copy_album_dir` | Copy one source album directory from `source_roots` into the library root. |
 | `quarantine` | Move a duplicate or uncertain item into quarantine. |
 | `write_tags` | Write explicit tag fields to one or more audio files. |
 | `ignore_finding` | Record that a finding is accepted and should not be reported again. |

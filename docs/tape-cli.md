@@ -466,6 +466,29 @@ VHS Hi-Fi SE-120 | 2026-05-03 | -14 LUFS target
           ...
 ```
 
+### tape play
+
+Play a tape project via mpv. Prefers rendered output if it exists;
+otherwise plays source tracks with the tape processing chain
+(gain, compressor, limiter) applied in real-time via mpv audio filters.
+
+```
+musiktool tape play <name> [options]
+```
+
+**Options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `--render-dir`, `-r` | auto-discover | Directory containing rendered output. |
+| `--queue`, `-q` | off | Append to current playlist instead of replacing. |
+
+**Rendered output discovery:** Checks `--render-dir` (if given), then the
+default render location (`musiktool/render/<slug>/`). If a rendered FLAC is
+found, it is played directly (already fully processed). If not, source
+tracks are played with per-track `af=` filters matching `tape analyze`
+output.
+
 ### tape delete
 
 Delete a tape project.

@@ -8,6 +8,8 @@ from musiktool.exceptions import (
     InvalidMediumError,
     InvalidPositionError,
     MissingLoudnessError,
+    MpvConnectionError,
+    MpvNotFoundError,
     MusiktoolError,
     PathNotFoundError,
     ProjectNotFoundError,
@@ -20,8 +22,12 @@ app = typer.Typer(
 )
 tape_app = typer.Typer(help="Tape mastering project management")
 index_app = typer.Typer(help="Library file index management")
+itunes_app = typer.Typer(help="iTunes XML catalog and import planning")
+player_app = typer.Typer(help="Playback control")
 app.add_typer(tape_app, name="tape")
 app.add_typer(index_app, name="index")
+app.add_typer(itunes_app, name="itunes")
+app.add_typer(player_app, name="player")
 
 
 @app.command()
@@ -331,13 +337,19 @@ def audit(
     sidecar_root: Path = typer.Option(None, "--sidecar-root", help="Out-of-tree sidecar root"),
     exclude: list[str] | None = typer.Option(None, "--exclude", help="Additional gitignore-style pattern to exclude"),
     similarity_threshold: float = typer.Option(0.08, "--similarity-threshold", help="Chromaprint BER threshold for audio duplicate detection (0.0=exact, 0.1=relaxed)"),
+    profile: str = typer.Option("auto", "--profile", help="Audit profile: music, radio, audiobook, podcast, or auto (from classification)"),
 ) -> None:
     """Audit a music library or staging source without modifying files."""
     import sqlite3
 
     from musiktool import db
     from musiktool.index import scan_path
-    from musiktool.library import audit_library, format_audit
+    from musiktool.library import PROFILE_NAMES, audit_library, format_audit
+
+    if profile not in PROFILE_NAMES:
+        raise ValidationError(
+            f"unknown profile: {profile} (choose from {', '.join(sorted(PROFILE_NAMES))})"
+        )
 
     def open_required_index_database(value: Path | None):
         try:
@@ -377,6 +389,7 @@ def audit(
             index_conn=conn if use_index else None,
             excludes=exclude,
             similarity_threshold=similarity_threshold,
+            profile=profile,
         )
         if index_scan_summary is not None:
             index_summary = result.summary.setdefault("index", {})
@@ -420,6 +433,7 @@ def apply_cmd(
     output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
     quarantine_dir: Path = typer.Option(None, "--quarantine-dir", help="Destination for quarantine actions"),
     db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+    skip: list[str] | None = typer.Option(None, "--skip", help="Action ID(s) to skip"),
 ) -> None:
     """Validate and optionally execute a whitelisted library fix plan."""
     import sqlite3
@@ -444,6 +458,7 @@ def apply_cmd(
             except (OSError, sqlite3.Error):
                 conn = None
 
+    skip_ids = set(skip) if skip else None
     try:
         if str(plan) == "-":
             result = apply_plan(
@@ -452,6 +467,7 @@ def apply_cmd(
                 dry_run=dry_run,
                 quarantine_dir=quarantine_dir,
                 db_conn=conn,
+                skip_ids=skip_ids,
             )
         else:
             result = apply_plan(
@@ -459,6 +475,7 @@ def apply_cmd(
                 dry_run=dry_run,
                 quarantine_dir=quarantine_dir,
                 db_conn=conn,
+                skip_ids=skip_ids,
             )
         typer.echo(format_apply(result, output_format), nl=False)
     finally:
@@ -469,7 +486,7 @@ def apply_cmd(
 @app.command()
 def propose(
     path: Path = typer.Argument(..., help="Library root path"),
-    proposal_type: str = typer.Option(..., "--type", help="Proposal type: year-folders"),
+    proposal_type: str = typer.Option(..., "--type", help="Proposal type: year-folders, media-kind-folders"),
     output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
     db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
     use_index: bool = typer.Option(True, "--index/--no-index", help="Use current index facts when available"),
@@ -479,9 +496,13 @@ def propose(
     import sqlite3
 
     from musiktool import db
-    from musiktool.library import format_propose, propose_year_folders
+    from musiktool.library import (
+        format_propose,
+        propose_media_kind_folders,
+        propose_year_folders,
+    )
 
-    if proposal_type != "year-folders":
+    if proposal_type not in ("year-folders", "media-kind-folders"):
         raise ValidationError(f"unknown proposal type: {proposal_type}")
 
     conn = None
@@ -499,16 +520,326 @@ def propose(
                 conn = db.get_connection(default_db)
             except (OSError, sqlite3.Error):
                 conn = None
-    try:
-        result = propose_year_folders(
-            path,
-            index_conn=conn,
-            excludes=exclude,
+
+    if proposal_type == "media-kind-folders" and conn is None:
+        raise ValidationError(
+            "media-kind-folders requires a library index database "
+            "(run 'musiktool index scan' first)"
         )
+
+    try:
+        if proposal_type == "year-folders":
+            result = propose_year_folders(
+                path,
+                index_conn=conn,
+                excludes=exclude,
+            )
+        else:
+            assert conn is not None
+            result = propose_media_kind_folders(
+                path,
+                conn=conn,
+                excludes=exclude,
+            )
         typer.echo(format_propose(result, output_format), nl=False)
     finally:
         if conn is not None:
             conn.close()
+
+
+@app.command()
+def stats(
+    path: Path = typer.Argument(..., help="Library root or directory to analyze"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    use_index: bool = typer.Option(True, "--index/--no-index", help="Enrich with index DB facts"),
+    exclude: list[str] | None = typer.Option(None, "--exclude", help="Gitignore-style exclude patterns"),
+) -> None:
+    """Show library statistics: file counts, formats, sizes, tag coverage."""
+    import sqlite3
+
+    from musiktool import db
+    from musiktool.library import compute_stats, format_stats
+
+    conn = None
+    if use_index and db_path is not None:
+        try:
+            conn = db.get_connection(db_path)
+        except (OSError, sqlite3.Error) as e:
+            raise ValidationError(
+                f"could not open index database: {db_path}: {e}"
+            ) from e
+    elif use_index:
+        default_db = db.default_db_path()
+        if default_db.exists():
+            try:
+                conn = db.get_connection(default_db)
+            except (OSError, sqlite3.Error):
+                conn = None
+
+    try:
+        result = compute_stats(path, index_conn=conn, excludes=exclude)
+        typer.echo(format_stats(result, output_format), nl=False)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# --- Play commands ---
+
+
+@app.command()
+def play(
+    path: Path = typer.Argument(..., help="Audio file or album directory"),
+    queue: bool = typer.Option(False, "--queue", "-q", help="Append to current playlist"),
+    next_: bool = typer.Option(False, "--next", "-n", help="Insert after current track"),
+    no_normalize: bool = typer.Option(False, "--no-normalize", help="Skip loudness normalization"),
+    db_path: Path = typer.Option(None, "--db", help="Database path"),
+) -> None:
+    """Play an audio file or album with EBU R128 loudness normalization."""
+    from musiktool import db as _db
+    from musiktool.play import MpvClient, queue_album, queue_file
+
+    if queue and next_:
+        raise ValidationError("--queue and --next are mutually exclusive")
+
+    if not path.exists():
+        raise PathNotFoundError(f"path does not exist: {path}")
+
+    if queue:
+        mode = "append-play"
+    elif next_:
+        mode = "insert-next"
+    else:
+        mode = "replace"
+
+    normalize = not no_normalize
+
+    # Open DB (optional — degrades gracefully without normalization)
+    conn = None
+    if normalize:
+        if db_path is not None:
+            conn = _db.get_connection(db_path)
+        else:
+            default = _db.default_db_path()
+            if default.exists():
+                try:
+                    conn = _db.get_connection(default)
+                except (OSError, Exception):
+                    conn = None
+
+    client = MpvClient()
+    try:
+        client.ensure_running()
+
+        if path.is_dir():
+            result = queue_album(client, conn, path, mode, normalize)
+            gain_info = ""
+            if result and result[0][1]:
+                # Extract gain from af string for display
+                af = result[0][1]
+                if "volume=" in af:
+                    gain_info = f" ({af.split('volume=')[1].split(',')[0].split(']')[0]})"
+            action = "Queued" if queue or next_ else "Playing"
+            typer.echo(f"{action} {path.name} ({len(result)} tracks){gain_info}")
+            if not result[0][1] and normalize:
+                typer.echo("  (no loudness data — playing without normalization)")
+        else:
+            resolved, af = queue_file(client, conn, path, mode, normalize)
+            gain_info = ""
+            if af and "volume=" in af:
+                gain_info = f" ({af.split('volume=')[1].split(',')[0].split(']')[0]})"
+            action = "Queued" if queue or next_ else "Playing"
+            typer.echo(f"{action} {path.name}{gain_info}")
+            if not af and normalize:
+                typer.echo("  (no loudness data — playing without normalization)")
+    finally:
+        client.close()
+        if conn is not None:
+            conn.close()
+
+
+def _format_time(seconds: float) -> str:
+    """Format seconds as M:SS or H:MM:SS."""
+    total = int(seconds)
+    h, remainder = divmod(total, 3600)
+    m, s = divmod(remainder, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+@player_app.command("status")
+def player_status(
+    output_format: str = typer.Option("text", "--format", help="Output format: text or json"),
+) -> None:
+    """Show current playback status."""
+    import json as _json
+
+    from musiktool.play import MpvClient
+
+    client = MpvClient()
+    if not client._try_connect():
+        if output_format == "json":
+            typer.echo(_json.dumps({"state": "stopped"}))
+        else:
+            typer.echo("Nothing playing.")
+        return
+
+    try:
+        status = client.get_status()
+
+        if output_format == "json":
+            import dataclasses
+            typer.echo(_json.dumps(dataclasses.asdict(status)))
+        else:
+            if status.state == "idle":
+                typer.echo("Idle (no track loaded)")
+                return
+
+            state_icon = "||" if status.state == "paused" else ">>"
+            pos = _format_time(status.position_sec)
+            dur = _format_time(status.duration_sec)
+
+            title = status.title or Path(status.path).stem if status.path else "?"
+            artist = status.artist or ""
+            display = f"{artist} — {title}" if artist else title
+
+            typer.echo(f"  {state_icon} {display}")
+            typer.echo(f"     {pos} / {dur}")
+            if status.playlist_count > 1:
+                typer.echo(f"     Track {status.playlist_pos + 1} of {status.playlist_count}")
+    finally:
+        client.close()
+
+
+@player_app.command("pause")
+def player_pause() -> None:
+    """Toggle pause/resume."""
+    from musiktool.play import MpvClient
+
+    client = MpvClient()
+    if not client._try_connect():
+        typer.echo("Nothing playing.")
+        return
+    try:
+        client.toggle_pause()
+    finally:
+        client.close()
+
+
+@player_app.command("skip")
+def player_skip() -> None:
+    """Skip to next track."""
+    from musiktool.play import MpvClient
+
+    client = MpvClient()
+    if not client._try_connect():
+        typer.echo("Nothing playing.")
+        return
+    try:
+        client.playlist_next()
+    finally:
+        client.close()
+
+
+@player_app.command("prev")
+def player_prev() -> None:
+    """Go to previous track."""
+    from musiktool.play import MpvClient
+
+    client = MpvClient()
+    if not client._try_connect():
+        typer.echo("Nothing playing.")
+        return
+    try:
+        client.playlist_prev()
+    finally:
+        client.close()
+
+
+@player_app.command("stop")
+def player_stop() -> None:
+    """Stop playback and quit mpv."""
+    from musiktool.play import MpvClient
+
+    client = MpvClient()
+    if not client._try_connect():
+        typer.echo("Nothing playing.")
+        return
+    try:
+        client.quit()
+        typer.echo("Stopped.")
+    except MpvConnectionError:
+        pass  # mpv already gone
+
+
+# --- iTunes subcommands ---
+
+
+@itunes_app.command("scan")
+def itunes_scan_cmd(
+    path: Path = typer.Argument(..., help="iTunes library root"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    xml_path: Path = typer.Option(None, "--xml", help="Explicit iTunes Music Library.xml path"),
+) -> None:
+    """Read an iTunes XML library and summarize importable content."""
+    from musiktool.itunes import format_scan, load_catalog
+
+    catalog = load_catalog(path, xml_path=xml_path)
+    typer.echo(format_scan(catalog, output_format), nl=False)
+
+
+@itunes_app.command("albums")
+def itunes_albums_cmd(
+    path: Path = typer.Argument(..., help="iTunes library root"),
+    artist: str = typer.Option(None, "--artist", help="Case-insensitive artist filter"),
+    album: str = typer.Option(None, "--album", help="Case-insensitive album filter"),
+    media_kind: str = typer.Option("music", "--media-kind", help="Media kind to list"),
+    limit: int = typer.Option(50, "--limit", help="Maximum albums to show"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    xml_path: Path = typer.Option(None, "--xml", help="Explicit iTunes Music Library.xml path"),
+) -> None:
+    """List iTunes albums for selective import review."""
+    from musiktool.itunes import filter_albums, format_albums, load_catalog
+
+    catalog = load_catalog(path, xml_path=xml_path)
+    albums = filter_albums(
+        catalog,
+        artist=artist,
+        album=album,
+        media_kind=media_kind,
+        limit=limit,
+    )
+    typer.echo(format_albums(albums, output_format=output_format), nl=False)
+
+
+@itunes_app.command("propose")
+def itunes_propose_cmd(
+    path: Path = typer.Argument(..., help="iTunes library root"),
+    target: Path = typer.Option(..., "--target", help="Target musiktool library root"),
+    artist: str = typer.Option(None, "--artist", help="Case-insensitive artist filter"),
+    album: str = typer.Option(None, "--album", help="Case-insensitive album filter"),
+    media_kind: str = typer.Option("music", "--media-kind", help="Media kind to import"),
+    limit: int = typer.Option(None, "--limit", help="Maximum matching albums to propose"),
+    include_protected: bool = typer.Option(False, "--include-protected", help="Include DRM-era protected AAC .m4p files"),
+    output_format: str = typer.Option("text", "--format", help="Output format: text, json, or ndjson"),
+    xml_path: Path = typer.Option(None, "--xml", help="Explicit iTunes Music Library.xml path"),
+) -> None:
+    """Generate a copy-only import plan from selected iTunes albums."""
+    from musiktool.itunes import build_import_plan, format_plan, load_catalog
+
+    catalog = load_catalog(path, xml_path=xml_path)
+    plan = build_import_plan(
+        catalog,
+        target=target,
+        artist=artist,
+        album=album,
+        media_kind=media_kind,
+        limit=limit,
+        include_protected=include_protected,
+    )
+    typer.echo(format_plan(plan, output_format), nl=False)
 
 
 # --- Index subcommands ---
@@ -609,6 +940,57 @@ def index_status_cmd(
     typer.echo("Library index")
     for name, count in stats.items():
         typer.echo(f"  {name}: {count}")
+
+
+@index_app.command("prune")
+def index_prune_cmd(
+    path: Path = typer.Argument(..., help="Library root to prune stale entries for"),
+    db_path: Path = typer.Option(None, "--db", help="Database path (default: ~/.local/share/musiktool/analytics.db)"),
+    dry_run: bool = typer.Option(True, "--dry-run/--execute", help="Preview removals without deleting"),
+) -> None:
+    """Remove index entries for files that no longer exist on disk."""
+    from musiktool import db
+
+    conn = db.get_connection(db_path)
+    try:
+        root_str = str(path.resolve()) + "/"
+        if dry_run:
+            rows = conn.execute(
+                "SELECT path FROM indexed_files WHERE path LIKE ? || '%'",
+                (root_str,),
+            ).fetchall()
+            missing_files = [row[0] for row in rows if not Path(row[0]).exists()]
+            class_rows = conn.execute(
+                "SELECT subject_path FROM library_classification WHERE subject_path LIKE ? || '%'",
+                (root_str,),
+            ).fetchall()
+            missing_class = [row[0] for row in class_rows if not Path(row[0]).exists()]
+            total_missing = len(missing_files) + len(missing_class)
+            if not total_missing:
+                typer.echo("No stale entries found.")
+                return
+            typer.echo(f"[DRY RUN] {total_missing} stale entries would be pruned:")
+            if missing_files:
+                typer.echo(f"  indexed files: {len(missing_files)}")
+            if missing_class:
+                typer.echo(f"  classifications: {len(missing_class)}")
+            all_missing = sorted(set(missing_files + missing_class))
+            for p in all_missing[:20]:
+                typer.echo(f"  {p}")
+            if len(all_missing) > 20:
+                typer.echo(f"  ... and {len(all_missing) - 20} more")
+            typer.echo("\nRun with --execute to remove.")
+        else:
+            counts = db.prune_missing(conn, root_str)
+            if not counts:
+                typer.echo("No stale entries found.")
+                return
+            total = sum(counts.values())
+            typer.echo(f"Pruned {total} stale entries:")
+            for table, count in sorted(counts.items()):
+                typer.echo(f"  {table}: {count}")
+    finally:
+        conn.close()
 
 
 @index_app.command("classify")
@@ -1096,6 +1478,34 @@ def tape_index_cmd(
         typer.echo(f"Generated: {cue_path}")
         typer.echo(f"Generated: {txt_path}")
     finally:
+        conn.close()
+
+
+@tape_app.command("play")
+def tape_play_cmd(
+    name: str = typer.Argument(..., help="Project name"),
+    render_dir: Path = typer.Option(None, "--render-dir", "-r", help="Directory containing rendered output"),
+    queue: bool = typer.Option(False, "--queue", "-q", help="Append to current playlist"),
+    as_playlist: bool = typer.Option(False, "--as-playlist", help="Play source tracks with processing (preview mode)"),
+) -> None:
+    """Play a tape project (rendered master or source preview)."""
+    from musiktool.play import MpvClient, queue_tape
+
+    mode = "append-play" if queue else "replace"
+    tape_mode = "playlist" if as_playlist else "rendered"
+    conn = _tape_conn()
+    client = MpvClient()
+    try:
+        client.ensure_running()
+        result = queue_tape(client, conn, name, mode, render_dir, tape_mode=tape_mode)
+        action = "Queued" if queue else "Playing"
+
+        if tape_mode == "rendered":
+            typer.echo(f"{action} \"{name}\" (rendered output, {len(result)} file(s))")
+        else:
+            typer.echo(f"{action} \"{name}\" ({len(result)} tracks, real-time processing)")
+    finally:
+        client.close()
         conn.close()
 
 

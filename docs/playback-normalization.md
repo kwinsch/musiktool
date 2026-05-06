@@ -459,7 +459,7 @@ musiktool analyze ~/Music  →  ~/.local/share/musiktool/analytics.db
 
 ## Implementation Status
 
-All steps are complete as of 2026-05-03:
+All steps are complete as of 2026-05-06:
 
 1. ~~`musiktool analyze` — bulk EBU R128 scan → SQLite DB (incremental)~~ (124 albums, 1851 tracks)
 2. ~~Medium presets — VHS, cassette, vinyl hardcoded in `constants.py`~~
@@ -468,3 +468,4 @@ All steps are complete as of 2026-05-03:
 5. ~~Segment builder — translates decisions into ffmpeg filter graphs~~
 6. ~~Renderer — assembles full output with gaps, markers, CUE + TXT indices~~
 7. ~~Two-sided media — cassette and vinyl with auto-split and side pinning~~
+8. ~~Digital playback — `musiktool play` with per-track EBU R128 normalization via mpv~~

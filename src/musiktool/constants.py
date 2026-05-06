@@ -9,6 +9,11 @@ AUDIO_EXTENSIONS = frozenset({".flac", ".mp3", ".m4a", ".ogg", ".wav", ".ape", "
 # (fortissimo, brass) become audibly affected. See docs/playback-normalization.md.
 TRANSPARENT_LIMITING_BUDGET_DB = 3.0
 
+# Default peak ceiling for digital output. 0 dBTP = full scale.
+# Hard-clip media (VHS, MD, CD) use -1 dBTP for intersample safety;
+# soft-clip media (cassette, reel) use 0 dBTP. Digital playback uses 0 dBTP.
+PEAK_CEILING_DBTP = 0.0
+
 OUTPUT_FORMATS = frozenset({".flac", ".wav"})
 
 SAMPLE_RATES = (44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000)

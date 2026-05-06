@@ -28,13 +28,34 @@ The scan is incremental: unchanged files are skipped on subsequent runs.
 ```bash
 musiktool propose <library> --type year-folders
 musiktool propose <library> --type year-folders --format json | musiktool apply -
+musiktool propose <library> --type media-kind-folders
+musiktool propose <library> --type media-kind-folders --format json | musiktool apply -
 ```
 
 `propose` generates fix plans for zero-judgment operations. Currently
 supported: `year-folders` (adds `(Year)` to album directories using consensus
-tag year). Review the plan, then pipe to `apply`.
+tag year) and `media-kind-folders` (moves classified albums into `music/`,
+`radio/`, `audiobooks/`, or `podcasts/`). Review the plan, then pipe to
+`apply`.
 
-### 2. Audit remaining issues
+### 2. Classify media kinds
+
+```bash
+musiktool audit <library> --format json --severity warning
+```
+
+Review findings. Albums with wrong-profile warnings (radio show flagged for
+missing `tracknumber`) need classification:
+
+```bash
+musiktool index classify <path> radio
+musiktool index classify <path> audiobook
+```
+
+Profile-aware audit (`--profile auto`, the default) then applies the right
+rules per album. Re-audit to verify classification reduced false warnings.
+
+### 3. Audit remaining issues
 
 ```bash
 musiktool audit <library> --format json --severity warning
@@ -43,7 +64,7 @@ musiktool audit <library> --format json --severity warning
 Reports structured findings with evidence dictionaries, confidence scores,
 and suggested actions. The agent reads these and decides what to fix.
 
-### 3. Inspect before acting
+### 4. Inspect before acting
 
 ```bash
 musiktool inspect <path> --format json
@@ -52,7 +73,7 @@ musiktool inspect <path> --format json
 Returns deeper evidence for one album, directory, or track. Use before
 proposing destructive or uncertain fixes — especially duplicate resolution.
 
-### 4. Compose a fix plan
+### 5. Compose a fix plan
 
 The agent builds a JSON fix plan using whitelisted actions:
 
@@ -61,13 +82,15 @@ The agent builds a JSON fix plan using whitelisted actions:
 | `rename_album_dir` | Add/correct year, fix canonical name |
 | `rename_track_file` | Fix filename to match `NN Title.ext` |
 | `move_file` | Move file within library root |
+| `copy_file` | Copy one external source file into the library for imports |
+| `copy_album_dir` | Copy one external album directory into the library for imports |
 | `quarantine` | Move duplicate or uncertain item to quarantine |
 | `write_tags` | Update metadata on audio files |
 | `ignore_finding` | Acknowledge a finding as acceptable |
 
 There is no `delete` action. Quarantine first; delete manually after review.
 
-### 5. Dry-run
+### 6. Dry-run
 
 ```bash
 musiktool apply plan.json
@@ -75,7 +98,7 @@ musiktool apply plan.json
 
 Validates the plan without modifying files. Check output before proceeding.
 
-### 6. Execute
+### 7. Execute
 
 ```bash
 musiktool apply plan.json --execute
@@ -87,14 +110,17 @@ Only after human approval. The agent should never execute without confirmation.
 
 **musiktool handles** (mechanical, zero-judgment):
 - Adding `(Year)` to folder names from consensus tag year
+- Moving albums into media-kind subtrees from classifications
+- Standardizing filenames to profile patterns (once implemented)
+- Profile-aware audit (different rules for music vs radio vs audiobook vs podcast)
 - Filesystem safety (path validation, collision detection, dry-run default)
 - Audio processing (fingerprinting, loudness measurement, tape rendering)
 
 **The agent handles** (requires music knowledge or judgment):
+- Media-kind classification (is this music or a radio show? tool suggests, agent decides)
 - Canonical album names ("Black Album" is actually the self-titled "Metallica")
 - Duplicate resolution (which copy to keep — same mastering? better format?)
 - Format preferences (FLAC is lossless archival, M4A may be lossy iTunes rip)
-- Structure reorganization (spoken content to `radio/`, `audiobooks/`, etc.)
 - Missing tag repair (via `musiktool identify` + MusicBrainz matching)
 - Compilation vs. split album detection
 - Remaster identification (bonus tracks, different loudness, different year)
@@ -151,7 +177,25 @@ Key fields vary by finding category:
 See `docs/library-cli.md` for the complete finding category reference and
 JSON schema.
 
-## Typical Agent Session
+## Duplicate Resolution
+
+When audit reports `duplicates.same_album_candidate`, the agent must decide
+which copy to keep. Decision factors, in priority order:
+
+1. **Format score.** FLAC (100) > WAV (95) > APE (90) > M4A (60) > MP3 (50).
+   Lossless always wins over lossy for archival.
+2. **Provenance.** Copy with CUE sheet + EAC log proves rip quality. Prefer
+   the one with provenance files.
+3. **Tag completeness.** Copy with all required tags is preferred.
+4. **Path correctness.** Copy already in the right Artist/Album (Year)/
+   structure is preferred over one in a dump directory.
+
+Action: quarantine the inferior copy. Never delete — the human reviews
+quarantine later.
+
+## Typical Agent Sessions
+
+### Targeted cleanup
 
 ```
 Human: "Clean up the Metallica albums"
@@ -166,6 +210,37 @@ Agent:
   3. musiktool apply edited-plan.json   (dry-run)
   4. Shows plan to human for approval
   5. musiktool apply edited-plan.json --execute
+```
+
+### Full library organization (from unstructured dump)
+
+```
+Human: "Organize this 1TB of mixed audio"
+
+Agent:
+  1. musiktool index scan /dump --hash --fingerprint
+     → builds file index with hashes, fingerprints, tags
+  2. musiktool audit /dump --format json
+     → gets overview: what has tags, what's missing, duplicates
+  3. musiktool identify /dump/unknown-album-1 -w
+     → identifies albums via AcoustID, writes tags
+     → repeats for each unidentified album directory
+  4. musiktool index classify /dump/radio-shows radio
+     musiktool index classify /dump/audiobooks audiobook
+     → classifies non-music content (agent judges from tags/genres)
+  5. musiktool propose /dump --type year-folders --format json | musiktool apply -
+     → adds (Year) to album folders from tag consensus
+     → reviews plan, applies
+  6. musiktool propose /dump --type media-kind-folders --format json | musiktool apply -
+     → moves albums into music/, radio/, audiobooks/ subtrees
+     → reviews plan, applies
+  7. musiktool audit /dump --format json --severity warning
+     → final audit: remaining tag gaps, duplicates, structural issues
+  8. Agent builds fix plans for remaining issues:
+     - write_tags for missing metadata
+     - quarantine for confirmed duplicates
+     - rename_album_dir for canonical name corrections
+  9. musiktool apply final-plan.json --execute
 ```
 
 The agent adds value by applying music knowledge that no rule engine has:

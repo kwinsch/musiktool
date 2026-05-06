@@ -7,6 +7,7 @@ from pathlib import Path
 
 import mutagen
 
+from musiktool.constants import PEAK_CEILING_DBTP, TRANSPARENT_LIMITING_BUDGET_DB
 from musiktool.exceptions import AudioReadError
 
 
@@ -169,3 +170,60 @@ def _parse_summary_value(output: str, key: str) -> float:
             except ValueError:
                 continue
     raise ValueError(f"failed to parse '{key}' from ffmpeg ebur128 output")
+
+
+# --- Gain computation ---
+
+
+def compute_gain(
+    measured_lufs: float,
+    true_peak_dbtp: float,
+    target_lufs: float,
+    peak_ceiling_dbtp: float = PEAK_CEILING_DBTP,
+    limiting_budget_db: float = TRANSPARENT_LIMITING_BUDGET_DB,
+) -> tuple[float, float, bool, float]:
+    """Compute gain with bounded peak limiting.
+
+    The limiting budget determines how many dB of peak limiting is acceptable
+    to reach (or approach) target LUFS. Gain is applied up to
+    max_safe_gain + budget, with the limiter catching the excess peaks.
+
+    Returns (gain_db, peak_after_gain, needs_limiter, limiter_penalty_db).
+    - gain_db: actual gain applied
+    - peak_after_gain: true peak after gain (before limiter)
+    - needs_limiter: True if gain pushes peaks above ceiling
+    - limiter_penalty_db: how much quieter than target due to budget exhaustion
+    """
+    desired_gain = target_lufs - measured_lufs
+    max_safe_gain = peak_ceiling_dbtp - true_peak_dbtp
+
+    if desired_gain <= max_safe_gain:
+        return desired_gain, true_peak_dbtp + desired_gain, False, 0.0
+
+    # Peaks prevent reaching target. Apply gain up to budget.
+    gain = min(desired_gain, max_safe_gain + limiting_budget_db)
+    peak_after = true_peak_dbtp + gain
+    penalty = desired_gain - gain
+    needs_limiter = gain > max_safe_gain
+    return gain, peak_after, needs_limiter, penalty
+
+
+def compute_gain_with_limiter(
+    measured_lufs: float,
+    true_peak_dbtp: float,
+    target_lufs: float,
+    peak_ceiling_dbtp: float = PEAK_CEILING_DBTP,
+    use_limiter: bool = False,
+) -> tuple[float, float, bool, float]:
+    """Compute gain with optional unlimited limiting budget.
+
+    When use_limiter is False: uses TRANSPARENT_LIMITING_BUDGET_DB (3 dB).
+    When use_limiter is True: unlimited budget (full desired gain applied).
+
+    Returns (gain_db, peak_after_gain, needs_limiter, limiter_penalty_db).
+    """
+    budget = float("inf") if use_limiter else TRANSPARENT_LIMITING_BUDGET_DB
+    return compute_gain(
+        measured_lufs, true_peak_dbtp, target_lufs, peak_ceiling_dbtp,
+        limiting_budget_db=budget,
+    )

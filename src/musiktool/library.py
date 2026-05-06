@@ -26,7 +26,10 @@ SCHEMA_VERSION = 1
 
 OUTPUT_FORMATS = {"text", "json", "ndjson"}
 SEVERITIES = {"info": 0, "warning": 1, "error": 2}
+_SEVERITY_ICONS = {"error": "\u2717", "warning": "\u26a0", "info": "\u2139"}
 FIX_PLAN_ACTIONS = {
+    "copy_album_dir",
+    "copy_file",
     "ignore_finding",
     "move_file",
     "quarantine",
@@ -37,6 +40,88 @@ FIX_PLAN_ACTIONS = {
 
 TRACK_FILENAME_RE = re.compile(r"^(?P<number>\d{2})\s+(?P<title>.+)\.[^.]+$")
 ALBUM_YEAR_RE = re.compile(r"\((?P<year>\d{4})\)$")
+
+# ---------------------------------------------------------------------------
+# Media profiles
+# ---------------------------------------------------------------------------
+
+_TAG_FIELD_MAP: dict[str, str] = {
+    "artist": "artist",
+    "album": "album",
+    "title": "title",
+    "tracknumber": "track_number",
+    "date": "year",
+}
+
+_MUSIC_REQUIRED: tuple[str, ...] = ("artist", "album", "title", "tracknumber", "date")
+
+
+@dataclass(frozen=True)
+class MediaProfile:
+    """Per-media-kind audit rules."""
+
+    name: str
+    required_tags: tuple[str, ...]
+    filename_re: re.Pattern[str]
+    filename_description: str
+    check_year_structure: bool
+    check_provenance: bool
+    check_track_number_match: bool
+
+
+_SPOKEN_FILENAME_RE = re.compile(r"^(?P<number>\d{2,3})\s+(?P<title>.+)\.[^.]+$")
+_PODCAST_FILENAME_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<title>.+)\.[^.]+$",
+)
+
+MEDIA_PROFILES: dict[str, MediaProfile] = {
+    "music": MediaProfile(
+        name="music",
+        required_tags=_MUSIC_REQUIRED,
+        filename_re=TRACK_FILENAME_RE,
+        filename_description="NN Title.ext",
+        check_year_structure=True,
+        check_provenance=True,
+        check_track_number_match=True,
+    ),
+    "radio": MediaProfile(
+        name="radio",
+        required_tags=("artist", "title"),
+        filename_re=_SPOKEN_FILENAME_RE,
+        filename_description="NN(N) Title.ext",
+        check_year_structure=False,
+        check_provenance=False,
+        check_track_number_match=False,
+    ),
+    "audiobook": MediaProfile(
+        name="audiobook",
+        required_tags=("artist", "title"),
+        filename_re=_SPOKEN_FILENAME_RE,
+        filename_description="NN(N) Title.ext",
+        check_year_structure=True,
+        check_provenance=False,
+        check_track_number_match=False,
+    ),
+    "podcast": MediaProfile(
+        name="podcast",
+        required_tags=("artist", "title", "date"),
+        filename_re=_PODCAST_FILENAME_RE,
+        filename_description="YYYY-MM-DD Title.ext",
+        check_year_structure=False,
+        check_provenance=False,
+        check_track_number_match=False,
+    ),
+}
+
+PROFILE_NAMES: frozenset[str] = frozenset((*MEDIA_PROFILES, "auto"))
+
+MEDIA_KIND_SUBTREES: dict[str, str] = {
+    "music": "music",
+    "radio": "radio",
+    "audiobook": "audiobooks",
+    "podcast": "podcasts",
+}
+_MEDIA_KIND_MIN_CONFIDENCE = 0.9
 
 AUXILIARY_SUFFIXES = {
     ".cue",
@@ -98,6 +183,7 @@ class AuditResult:
     summary: dict[str, Any]
     findings: list[Finding]
     checks: list[dict[str, Any]] = field(default_factory=list)
+    album_profiles: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -225,6 +311,61 @@ class ProposeResult:
 
 
 @dataclass
+class StatsResult:
+    """Library statistics overview."""
+
+    root: str
+    generated_at: str
+    albums: int
+    tracks: int
+    total_files: int
+    audio_files: int
+    non_audio_files: int
+    total_bytes: int
+    audio_bytes: int
+    non_audio_bytes: int
+    format_histogram: list[dict[str, Any]]
+    asset_histogram: list[dict[str, Any]]
+    provenance: dict[str, int]
+    # DB-enriched fields (None when no index DB available):
+    tag_coverage: dict[str, dict[str, int]] | None = None
+    codec_histogram: list[dict[str, Any]] | None = None
+    classifications: dict[str, int] | None = None
+    index_coverage: dict[str, int] | None = None
+    loudness_coverage: dict[str, int] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "command": "stats",
+            "root": self.root,
+            "generated_at": self.generated_at,
+            "albums": self.albums,
+            "tracks": self.tracks,
+            "total_files": self.total_files,
+            "audio_files": self.audio_files,
+            "non_audio_files": self.non_audio_files,
+            "total_bytes": self.total_bytes,
+            "audio_bytes": self.audio_bytes,
+            "non_audio_bytes": self.non_audio_bytes,
+            "format_histogram": self.format_histogram,
+            "asset_histogram": self.asset_histogram,
+            "provenance": self.provenance,
+        }
+        if self.tag_coverage is not None:
+            result["tag_coverage"] = self.tag_coverage
+        if self.codec_histogram is not None:
+            result["codec_histogram"] = self.codec_histogram
+        if self.classifications is not None:
+            result["classifications"] = self.classifications
+        if self.index_coverage is not None:
+            result["index_coverage"] = self.index_coverage
+        if self.loudness_coverage is not None:
+            result["loudness_coverage"] = self.loudness_coverage
+        return result
+
+
+@dataclass
 class _IndexedTrackFacts:
     path: Path
     current: bool
@@ -325,6 +466,52 @@ class _AuditIndex:
         return counts
 
 
+def _resolve_album_profile(
+    album_dir: Path,
+    profile: str,
+    audit_index: _AuditIndex | None,
+    ignore_policy: IgnorePolicy | None,
+) -> MediaProfile:
+    """Return the effective MediaProfile for *album_dir*."""
+    if profile != "auto":
+        return MEDIA_PROFILES[profile]
+    if audit_index is None:
+        return MEDIA_PROFILES["music"]
+    classification = _resolve_album_classification(
+        album_dir,
+        audit_index.conn,
+        ignore_policy,
+        audit_index=audit_index,
+    )
+    if classification is not None:
+        kind = classification["media_kind"]
+        if kind in MEDIA_PROFILES:
+            return MEDIA_PROFILES[kind]
+    return MEDIA_PROFILES["music"]
+
+
+def _resolve_album_classification(
+    album_dir: Path,
+    conn: sqlite3.Connection,
+    ignore_policy: IgnorePolicy | None,
+    *,
+    audit_index: _AuditIndex | None = None,
+) -> sqlite3.Row | None:
+    """Return directory classification, falling back to first indexed track."""
+    classification = db.get_effective_library_classification(conn, str(album_dir))
+    if classification is not None:
+        return classification
+
+    if audit_index is None:
+        audit_index = _AuditIndex(conn)
+    for track in _direct_audio_files(album_dir, ignore_policy):
+        facts = audit_index.facts(track)
+        if facts.classification is not None:
+            return facts.classification
+        break  # One current indexed track is enough to resolve album profile.
+    return None
+
+
 def audit_library(
     path: Path,
     *,
@@ -334,8 +521,10 @@ def audit_library(
     index_conn: sqlite3.Connection | None = None,
     excludes: list[str] | None = None,
     similarity_threshold: float = 0.08,
+    profile: str = "auto",
 ) -> AuditResult:
     """Audit a library or staging path without modifying files."""
+    assert profile in PROFILE_NAMES, f"unknown profile: {profile}"
     _validate_severity(min_severity)
     root = path.resolve()
     if not root.exists():
@@ -381,16 +570,24 @@ def audit_library(
                 ))
 
     album_set = set(album_dirs)
+    profiles_used: dict[str, int] = {}
+    album_profiles: dict[str, str] = {}
     for album_dir in album_dirs:
         rel_parts = _relative_parts(album_dir, root)
+        album_profile = _resolve_album_profile(
+            album_dir, profile, audit_index, ignore_policy,
+        )
+        profiles_used[album_profile.name] = profiles_used.get(album_profile.name, 0) + 1
+        album_profiles[str(album_dir)] = album_profile.name
         if include_warning_findings:
             _audit_album_structure(
                 root, album_dir, rel_parts, findings,
                 audit_index=audit_index,
                 ignore_policy=ignore_policy,
+                profile=album_profile,
             )
         if include_info_findings:
-            _audit_album_provenance(album_dir, findings)
+            _audit_album_provenance(album_dir, findings, profile=album_profile)
         if include_warning_findings or include_info_findings:
             _audit_tracks(
                 album_dir,
@@ -399,6 +596,7 @@ def audit_library(
                 include_info=include_info_findings,
                 audit_index=audit_index,
                 ignore_policy=ignore_policy,
+                profile=album_profile,
             )
 
         if include_warning_findings:
@@ -453,11 +651,12 @@ def audit_library(
                 "sources": audit_index.source_counts(),
             })
 
-    summary = {
+    summary: dict[str, Any] = {
         "albums_scanned": len(album_dirs),
         "tracks_scanned": len(audio_files),
         "findings": len(filtered),
         "by_severity": by_severity,
+        "profiles_used": profiles_used,
     }
     if audit_index is not None:
         summary["index"] = {
@@ -470,6 +669,7 @@ def audit_library(
         summary=summary,
         findings=filtered,
         checks=checks,
+        album_profiles=album_profiles,
     )
 
 
@@ -521,6 +721,7 @@ def apply_plan(
     dry_run: bool = True,
     quarantine_dir: Path | None = None,
     db_conn: sqlite3.Connection | None = None,
+    skip_ids: set[str] | None = None,
 ) -> ApplyResult:
     """Validate and optionally execute a whitelisted fix plan."""
     label = str(plan_path)
@@ -544,6 +745,8 @@ def apply_plan(
     if not library_root.exists():
         raise PathNotFoundError(f"library_root does not exist: {library_root}")
 
+    source_roots = _coerce_source_roots(plan.get("source_roots"), library_root)
+
     qdir = (
         quarantine_dir.resolve(strict=False)
         if quarantine_dir is not None
@@ -554,17 +757,39 @@ def apply_plan(
     if not isinstance(actions_value, list):
         raise ValidationError("fix plan actions must be a list")
 
-    action_results: list[ApplyActionResult] = []
+    validated_actions: list[tuple[dict[str, Any], list[str], bool]] = []
     for index, raw_action in enumerate(actions_value, 1):
-        action = _validate_action(raw_action, index, library_root, qdir)
+        action = _validate_action(
+            raw_action,
+            index,
+            library_root,
+            qdir,
+            source_roots,
+        )
         warnings = _action_warnings(action, db_conn)
+        skipped = skip_ids is not None and action["action_id"] in skip_ids
+        validated_actions.append((action, warnings, skipped))
+
+    _validate_path_move_conflicts(
+        action
+        for action, _warnings, skipped in validated_actions
+        if not skipped
+    )
+
+    action_results: list[ApplyActionResult] = []
+    for action, warnings, skipped in validated_actions:
         db_updates = None
-        if not dry_run:
+        if not dry_run and not skipped:
             _execute_action(action)
             db_updates = _relocate_action_paths(action, db_conn)
-        status = "would_apply" if dry_run and action["type"] != "ignore_finding" else "applied"
-        if dry_run and action["type"] == "ignore_finding":
+        if skipped:
+            status = "skipped"
+        elif dry_run and action["type"] == "ignore_finding":
             status = "would_ignore"
+        elif dry_run:
+            status = "would_apply"
+        else:
+            status = "applied"
         action_results.append(ApplyActionResult(
             action_id=action["action_id"],
             type=action["type"],
@@ -608,8 +833,18 @@ def propose_year_folders(
     actions: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for album_dir in album_dirs:
+        if audit_index is not None:
+            album_profile = _resolve_album_profile(
+                album_dir,
+                "auto",
+                audit_index,
+                ignore_policy,
+            )
+            if not album_profile.check_year_structure:
+                continue
         rel_parts = _relative_parts(album_dir, root)
-        if len(rel_parts) > 2:
+        layout_parts = _album_layout_parts(rel_parts)
+        if len(layout_parts) > 2:
             continue
         if ALBUM_YEAR_RE.search(album_dir.name):
             continue
@@ -629,6 +864,7 @@ def propose_year_folders(
             })
             continue
 
+        tracks = _direct_audio_files(album_dir, ignore_policy)
         action: dict[str, Any] = {
             "action_id": f"rename_album_dir:{len(actions) + 1}",
             "type": "rename_album_dir",
@@ -636,6 +872,8 @@ def propose_year_folders(
             "source": str(album_dir),
             "destination": str(destination),
             "reason": f'Rename to "{suggested_name}" (tag year).',
+            "track_count": len(tracks),
+            "formats": sorted({p.suffix.lower().lstrip(".") for p in tracks}),
         }
         if index_conn is not None:
             refs = db.find_tape_references(index_conn, str(album_dir))
@@ -656,36 +894,302 @@ def propose_year_folders(
     )
 
 
-def format_audit(result: AuditResult, output_format: str = "text") -> str:
-    """Render an audit result."""
-    _validate_output_format(output_format)
-    if output_format == "json":
-        return _json(result.to_dict())
-    if output_format == "ndjson":
-        lines = [
-            _json_line({
-                "schema_version": SCHEMA_VERSION,
-                "command": "audit",
-                "type": "summary",
-                "root": result.root,
-                "generated_at": result.generated_at,
-                "summary": result.summary,
-            })
-        ]
-        lines.extend(_json_line({"type": "finding", **f.to_dict()}) for f in result.findings)
-        return "\n".join(lines) + "\n"
+def propose_media_kind_folders(
+    path: Path,
+    *,
+    conn: sqlite3.Connection,
+    excludes: list[str] | None = None,
+) -> ProposeResult:
+    """Generate rename actions to move albums into media-kind subtrees."""
+    root = path.resolve()
+    if not root.exists():
+        raise PathNotFoundError(f"path does not exist: {root}")
 
-    lines = [result.root, ""]
+    ignore_policy = load_ignore_policy(root, excludes=excludes)
+    album_dirs = _discover_album_dirs(root, ignore_policy)
+
+    subtree_names = set(MEDIA_KIND_SUBTREES.values())
+    audit_index = _AuditIndex(conn)
+
+    actions: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for album_dir in album_dirs:
+        rel_parts = _relative_parts(album_dir, root)
+        if not rel_parts:
+            continue
+
+        # Already under a recognized subtree?
+        if rel_parts[0] in subtree_names:
+            cls = _resolve_album_classification(
+                album_dir,
+                conn,
+                ignore_policy,
+                audit_index=audit_index,
+            )
+            if cls is not None:
+                expected = MEDIA_KIND_SUBTREES.get(cls["media_kind"])
+                if expected == rel_parts[0]:
+                    continue  # already correct
+            skipped.append({
+                "path": str(album_dir),
+                "reason": "wrong_subtree",
+                "current_subtree": rel_parts[0],
+                "classified_as": cls["media_kind"] if cls else None,
+            })
+            continue
+
+        cls = _resolve_album_classification(
+            album_dir,
+            conn,
+            ignore_policy,
+            audit_index=audit_index,
+        )
+        if cls is None:
+            skipped.append({"path": str(album_dir), "reason": "unclassified"})
+            continue
+
+        media_kind = cls["media_kind"]
+        source = cls["source"]
+        confidence = cls["confidence"]
+
+        if source != "manual" and confidence < _MEDIA_KIND_MIN_CONFIDENCE:
+            skipped.append({
+                "path": str(album_dir),
+                "reason": "low_confidence",
+                "media_kind": media_kind,
+                "source": source,
+                "confidence": confidence,
+            })
+            continue
+
+        subtree = MEDIA_KIND_SUBTREES.get(media_kind)
+        if subtree is None:
+            skipped.append({
+                "path": str(album_dir),
+                "reason": "unknown_media_kind",
+                "media_kind": media_kind,
+            })
+            continue
+
+        destination = root / subtree / album_dir.relative_to(root)
+        if destination.exists():
+            skipped.append({
+                "path": str(album_dir),
+                "reason": "destination_exists",
+                "destination": str(destination),
+            })
+            continue
+
+        tracks = _direct_audio_files(album_dir, ignore_policy)
+        action: dict[str, Any] = {
+            "action_id": f"rename_album_dir:{len(actions) + 1}",
+            "type": "rename_album_dir",
+            "because_finding": "structure.media_kind_subtree_missing",
+            "source": str(album_dir),
+            "destination": str(destination),
+            "reason": f"Move to {subtree}/ ({media_kind}, {source}).",
+            "track_count": len(tracks),
+            "formats": sorted({p.suffix.lower().lstrip(".") for p in tracks}),
+        }
+        refs = db.find_tape_references(conn, str(album_dir))
+        if refs:
+            action["tape_references"] = [
+                {"project": name, "path": item_path}
+                for name, item_path in refs
+            ]
+        actions.append(action)
+
+    return ProposeResult(
+        library_root=str(root),
+        generated_at=_now(),
+        generated_by="musiktool propose media-kind-folders",
+        proposal_type="media-kind-folders",
+        actions=actions,
+        skipped=skipped,
+    )
+
+
+def _finding_album_dirs(finding: Finding, root: str) -> list[str]:
+    """Return album directory paths this finding should appear under."""
+    root_resolved = root.rstrip("/")
+    result_dirs: list[str] = []
+    for path_str in finding.paths:
+        p = Path(path_str)
+        try:
+            p.relative_to(root_resolved)
+        except ValueError:
+            continue
+        # Files (audio or non-audio with a suffix) belong to their parent dir.
+        # Directories (album dirs) are used directly.
+        if p.suffix:
+            album = str(p.parent)
+        else:
+            album = path_str
+        if album == root_resolved:
+            continue
+        if album not in result_dirs:
+            result_dirs.append(album)
+    return result_dirs
+
+
+_AGGREGATABLE_CATEGORIES = frozenset({
+    "tags.missing_required",
+    "tags.track_number_mismatch",
+    "tracks.filename_pattern",
+})
+
+
+def _finding_detail(finding: Finding, root: str, album_dir: str) -> str:
+    """Concise one-line detail from category and evidence."""
+    cat = finding.category
+    ev = finding.evidence
+
+    if cat == "structure.album_year_missing":
+        suggested = ev.get("suggested_name")
+        if suggested:
+            return f"\u2192 {suggested}"
+        return "no consensus year"
+
+    if cat == "structure.album_year_invalid":
+        return f"year {ev.get('year')} implausible"
+
+    if cat == "structure.nested_album":
+        parent_info = ev.get("parent", {})
+        nested_info = ev.get("nested", {})
+        nested_path = nested_info.get("path", "")
+        parent_path = parent_info.get("path", "")
+        # Under the parent album, describe the nested child.
+        # Under the nested album itself, describe the parent.
+        if album_dir == parent_path or album_dir != nested_path:
+            count = nested_info.get("track_count", "?")
+            formats = ", ".join(nested_info.get("formats", []))
+            nested_name = Path(nested_path).name
+            return f"{nested_name} (nested, {count} tracks {formats})"
+        try:
+            parent_rel = str(Path(parent_path).relative_to(root))
+        except ValueError:
+            parent_rel = parent_path
+        return f"nested under {parent_rel}"
+
+    if cat == "structure.stray_file":
+        return ev.get("name", "")
+
+    if cat in ("provenance.cue_missing", "provenance.eac_log_missing"):
+        return ""
+
+    if cat in ("duplicates.same_album_candidate", "duplicates.source_already_curated"):
+        evidence_type = ev.get("evidence_type", "")
+        other_paths = [
+            p for p in finding.paths
+            if p != album_dir
+        ]
+        if other_paths:
+            try:
+                rel = str(Path(other_paths[0]).relative_to(root))
+            except ValueError:
+                rel = other_paths[0]
+            return f"{evidence_type} with {rel}"
+        return evidence_type
+
+    return ""
+
+
+def _aggregate_lines(
+    findings: list[Finding], category: str,
+) -> str:
+    """Collapse per-track findings of the same category into one line."""
+    count = len(findings)
+    if category == "tags.missing_required":
+        all_missing: set[str] = set()
+        for f in findings:
+            all_missing.update(f.evidence.get("missing", []))
+        fields = ", ".join(sorted(all_missing))
+        return f"{count} tracks missing: {fields}"
+    if category == "tags.track_number_mismatch":
+        return f"{count} tracks: filename/tag track number disagree"
+    if category == "tracks.filename_pattern":
+        return f"{count} tracks: filename does not match NN Title.ext"
+    return f"{count} findings"
+
+
+def _format_audit_text(result: AuditResult) -> str:
+    """Render audit result as grouped operator-facing text."""
+    root = result.root
+
+    groups: dict[str, list[Finding]] = {}
+    library_findings: list[Finding] = []
+    for finding in result.findings:
+        album_dirs = _finding_album_dirs(finding, root)
+        if not album_dirs:
+            library_findings.append(finding)
+        else:
+            for album_dir in album_dirs:
+                groups.setdefault(album_dir, []).append(finding)
+
+    root_path = Path(root)
+    sorted_albums = sorted(groups.keys(), key=lambda d: str(Path(d).relative_to(root_path)))
+
+    lines: list[str] = []
+
+    if library_findings:
+        lines.append("(library root)")
+        for f in library_findings:
+            icon = _SEVERITY_ICONS.get(f.severity, "?")
+            short_cat = f.category.rsplit(".", 1)[-1]
+            detail = _finding_detail(f, root, root)
+            if detail:
+                lines.append(f"  {icon} {short_cat}: {detail}")
+            else:
+                lines.append(f"  {icon} {short_cat}")
+        lines.append("")
+
+    for album_dir in sorted_albums:
+        album_findings = groups[album_dir]
+        try:
+            header = str(Path(album_dir).relative_to(root_path))
+        except ValueError:
+            header = album_dir
+        album_profile_name = result.album_profiles.get(album_dir)
+        if album_profile_name and album_profile_name != "music":
+            header = f"{header}  [{album_profile_name}]"
+        lines.append(header)
+
+        aggregatable: dict[str, list[Finding]] = {}
+        individual: list[Finding] = []
+        for f in album_findings:
+            if f.category in _AGGREGATABLE_CATEGORIES:
+                aggregatable.setdefault(f.category, []).append(f)
+            else:
+                individual.append(f)
+
+        for f in individual:
+            icon = _SEVERITY_ICONS.get(f.severity, "?")
+            short_cat = f.category.rsplit(".", 1)[-1]
+            detail = _finding_detail(f, root, album_dir)
+            if detail:
+                lines.append(f"  {icon} {short_cat}: {detail}")
+            else:
+                lines.append(f"  {icon} {short_cat}")
+
+        for cat in sorted(aggregatable):
+            cat_findings = aggregatable[cat]
+            severity = cat_findings[0].severity
+            icon = _SEVERITY_ICONS.get(severity, "?")
+            text = _aggregate_lines(cat_findings, cat)
+            lines.append(f"  {icon} {text}")
+
+        lines.append("")
+
     if not result.findings:
         lines.append("No findings.")
     else:
-        for finding in result.findings:
-            lines.append(f"  {finding.severity:<7s}  {finding.category}")
-            for p in finding.paths:
-                lines.append(f"           {p}")
-            lines.append(f"           {finding.message}")
-            lines.append("")
         lines.append(f"{len(result.findings)} findings")
+
+    profiles_used = result.summary.get("profiles_used")
+    if isinstance(profiles_used, dict) and len(profiles_used) > 1:
+        parts = [f"{count} {name}" for name, count in sorted(profiles_used.items())]
+        lines.append(f"Profiles: {', '.join(parts)}")
+
     index_summary = result.summary.get("index")
     if isinstance(index_summary, dict):
         sources = index_summary.get("fact_sources")
@@ -705,7 +1209,29 @@ def format_audit(result: AuditResult, output_format: str = "text") -> str:
                 f"{refresh.get('files_from_sidecar', 0)} from sidecar, "
                 f"{refresh.get('files_skipped', 0)} current"
             )
+
     return "\n".join(lines) + "\n"
+
+
+def format_audit(result: AuditResult, output_format: str = "text") -> str:
+    """Render an audit result."""
+    _validate_output_format(output_format)
+    if output_format == "json":
+        return _json(result.to_dict())
+    if output_format == "ndjson":
+        lines = [
+            _json_line({
+                "schema_version": SCHEMA_VERSION,
+                "command": "audit",
+                "type": "summary",
+                "root": result.root,
+                "generated_at": result.generated_at,
+                "summary": result.summary,
+            })
+        ]
+        lines.extend(_json_line({"type": "finding", **f.to_dict()}) for f in result.findings)
+        return "\n".join(lines) + "\n"
+    return _format_audit_text(result)
 
 
 def format_inspect(result: InspectResult, output_format: str = "text") -> str:
@@ -804,9 +1330,10 @@ def format_propose(result: ProposeResult, output_format: str = "text") -> str:
         return "\n".join(lines) + "\n"
 
     root = result.library_root
+    verb = "move" if result.proposal_type == "media-kind-folders" else "rename"
     lines = [
         f"Propose: {result.proposal_type} "
-        f"({len(result.actions)} rename(s), {len(result.skipped)} skipped)",
+        f"({len(result.actions)} {verb}(s), {len(result.skipped)} skipped)",
         "",
     ]
     for action in result.actions:
@@ -823,7 +1350,13 @@ def format_propose(result: ProposeResult, output_format: str = "text") -> str:
         if tape_refs:
             projects = sorted({r["project"] for r in tape_refs})
             tape_suffix = f"  [{', '.join(projects)}: {len(tape_refs)} ref(s)]"
-        lines.append(f"  {src_rel}  \u2192  {dst_rel}{tape_suffix}")
+        track_count = action.get("track_count")
+        formats = action.get("formats")
+        meta = ""
+        if track_count is not None:
+            fmt_str = "/".join(formats) if formats else "?"
+            meta = f"  ({track_count} tracks, {fmt_str})"
+        lines.append(f"  {src_rel}  \u2192  {dst_rel}{meta}{tape_suffix}")
     if result.skipped:
         lines.append("")
         lines.append("Skipped:")
@@ -842,6 +1375,383 @@ def format_propose(result: ProposeResult, output_format: str = "text") -> str:
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+
+def compute_stats(
+    path: Path,
+    *,
+    index_conn: sqlite3.Connection | None = None,
+    excludes: list[str] | None = None,
+) -> StatsResult:
+    """Compute library statistics by walking the filesystem.
+
+    If *index_conn* is provided, enriches with tag coverage, codec histogram,
+    classification distribution, index coverage, and loudness coverage from DB.
+    """
+    root = path.resolve()
+    ignore_policy = load_ignore_policy(root, excludes=excludes)
+    album_dirs = _discover_album_dirs(root, ignore_policy)
+    audio_files = _audio_files_under(root, ignore_policy)
+    all_files = _files_under(root, ignore_policy)
+    audio_file_set = set(audio_files)
+
+    ext_counts: dict[str, int] = {}
+    ext_bytes: dict[str, int] = {}
+    asset_counts: dict[str, int] = {}
+    asset_bytes: dict[str, int] = {}
+    total_bytes = 0
+    audio_bytes = 0
+    non_audio_bytes = 0
+
+    for file_path in all_files:
+        try:
+            size = file_path.stat().st_size
+        except OSError:
+            size = 0
+        total_bytes += size
+
+        if file_path in audio_file_set:
+            audio_bytes += size
+            ext = file_path.suffix.lower()
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            ext_bytes[ext] = ext_bytes.get(ext, 0) + size
+        else:
+            non_audio_bytes += size
+            kind = _asset_kind(file_path)
+            asset_counts[kind] = asset_counts.get(kind, 0) + 1
+            asset_bytes[kind] = asset_bytes.get(kind, 0) + size
+
+    format_histogram = sorted(
+        [
+            {"ext": ext, "count": ext_counts[ext], "bytes": ext_bytes.get(ext, 0)}
+            for ext in ext_counts
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+    asset_histogram = sorted(
+        [
+            {
+                "kind": kind,
+                "count": asset_counts[kind],
+                "bytes": asset_bytes.get(kind, 0),
+            }
+            for kind in asset_counts
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+
+    provenance = _stats_provenance(album_dirs, ignore_policy=ignore_policy)
+
+    # DB-enriched stats
+    tag_coverage = None
+    codec_histogram = None
+    classifications = None
+    index_coverage = None
+    loudness_coverage = None
+
+    if index_conn is not None:
+        audit_index = _AuditIndex(index_conn)
+        provenance = _stats_provenance(
+            album_dirs,
+            audit_index=audit_index,
+            ignore_policy=ignore_policy,
+        )
+        index_coverage = _stats_index_coverage(index_conn, audio_files)
+        tag_coverage = _stats_tag_coverage(audio_files, audit_index)
+        codec_histogram = _stats_codec_histogram(audio_files, audit_index)
+        classifications = _stats_classifications(
+            album_dirs,
+            audit_index,
+            ignore_policy,
+        )
+        loudness_coverage = _stats_loudness_coverage(
+            index_conn,
+            audio_files,
+            album_dirs,
+        )
+
+    return StatsResult(
+        root=str(root),
+        generated_at=_now(),
+        albums=len(album_dirs),
+        tracks=len(audio_files),
+        total_files=len(all_files),
+        audio_files=len(audio_files),
+        non_audio_files=len(all_files) - len(audio_files),
+        total_bytes=total_bytes,
+        audio_bytes=audio_bytes,
+        non_audio_bytes=non_audio_bytes,
+        format_histogram=format_histogram,
+        asset_histogram=asset_histogram,
+        provenance=provenance,
+        tag_coverage=tag_coverage or None,
+        codec_histogram=codec_histogram,
+        classifications=classifications,
+        index_coverage=index_coverage,
+        loudness_coverage=loudness_coverage,
+    )
+
+
+def _asset_kind(path: Path) -> str:
+    """Classify a non-audio side file for inventory/reporting."""
+    suffix = path.suffix.lower()
+    if suffix == ".cue":
+        return "cue_sheet"
+    if suffix == ".log":
+        return "rip_log" if _is_eac_log(path) else "log"
+    if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}:
+        return "image"
+    if suffix == ".pdf":
+        return "booklet"
+    if suffix in {".m3u", ".m3u8", ".xspf", ".pls"}:
+        return "playlist"
+    if suffix in {".txt", ".nfo", ".md"}:
+        return "text"
+    return "other"
+
+
+def _stats_provenance(
+    album_dirs: list[Path],
+    *,
+    audit_index: _AuditIndex | None = None,
+    ignore_policy: IgnorePolicy | None = None,
+) -> dict[str, int]:
+    checked_albums = 0
+    albums_with_cue = 0
+    albums_with_eac_log = 0
+    cue_files = 0
+    eac_logs = 0
+    for album in album_dirs:
+        if audit_index is not None:
+            profile = _resolve_album_profile(album, "auto", audit_index, ignore_policy)
+            if not profile.check_provenance:
+                continue
+        checked_albums += 1
+        cues = _cue_files(album)
+        logs = _eac_logs(album)
+        if cues:
+            albums_with_cue += 1
+            cue_files += len(cues)
+        if logs:
+            albums_with_eac_log += 1
+            eac_logs += len(logs)
+    return {
+        "albums": checked_albums,
+        "albums_with_cue": albums_with_cue,
+        "albums_with_eac_log": albums_with_eac_log,
+        "cue_files": cue_files,
+        "eac_logs": eac_logs,
+    }
+
+
+def _stats_index_coverage(
+    conn: sqlite3.Connection,
+    audio_files: list[Path],
+) -> dict[str, int]:
+    indexed = 0
+    stale = 0
+    missing = 0
+    for file_path in audio_files:
+        row = db.get_indexed_file(conn, str(file_path))
+        if row is None:
+            missing += 1
+            continue
+        try:
+            stat = file_path.stat()
+        except OSError:
+            stale += 1
+            continue
+        if db.indexed_file_unchanged(row, size=stat.st_size, mtime_ns=stat.st_mtime_ns):
+            indexed += 1
+        else:
+            stale += 1
+    return {
+        "indexed": indexed,
+        "stale": stale,
+        "missing": missing,
+        "total": len(audio_files),
+    }
+
+
+def _stats_tag_coverage(
+    audio_files: list[Path],
+    audit_index: _AuditIndex,
+) -> dict[str, dict[str, int]]:
+    fields = ("artist", "album", "title", "date", "track_number")
+    result = {field: {"have": 0, "total": len(audio_files)} for field in fields}
+    for file_path in audio_files:
+        tags = audit_index.tags(file_path)
+        values = {
+            "artist": tags.artist,
+            "album": tags.album,
+            "title": tags.title,
+            "date": tags.year,
+            "track_number": tags.track_number,
+        }
+        for field in fields:
+            if values[field] is not None:
+                result[field]["have"] += 1
+    return result
+
+
+def _stats_codec_histogram(
+    audio_files: list[Path],
+    audit_index: _AuditIndex,
+) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    durations: dict[str, float] = {}
+    for file_path in audio_files:
+        facts = audit_index.facts(file_path)
+        codec = None
+        duration = None
+        if facts.current and facts.audio is not None:
+            codec = facts.audio["codec"]
+            duration = facts.audio["duration_sec"]
+        codec = str(codec or file_path.suffix.lower().lstrip(".") or "unknown")
+        counts[codec] = counts.get(codec, 0) + 1
+        if duration is not None:
+            durations[codec] = durations.get(codec, 0.0) + float(duration)
+    return [
+        {
+            "codec": codec,
+            "count": counts[codec],
+            "duration_sec": round(durations[codec], 3) if codec in durations else None,
+        }
+        for codec in sorted(counts, key=lambda c: (-counts[c], c))
+    ]
+
+
+def _stats_classifications(
+    album_dirs: list[Path],
+    audit_index: _AuditIndex,
+    ignore_policy: IgnorePolicy,
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for album in album_dirs:
+        profile = _resolve_album_profile(album, "auto", audit_index, ignore_policy)
+        result[profile.name] = result.get(profile.name, 0) + 1
+    return result
+
+
+def _stats_loudness_coverage(
+    conn: sqlite3.Connection,
+    audio_files: list[Path],
+    album_dirs: list[Path],
+) -> dict[str, int]:
+    tracks = 0
+    for file_path in audio_files:
+        if db.get_track(conn, str(file_path)) is not None:
+            tracks += 1
+    albums = 0
+    for album in album_dirs:
+        row = conn.execute(
+            "SELECT 1 FROM album_loudness WHERE path = ?",
+            (str(album),),
+        ).fetchone()
+        if row is not None:
+            albums += 1
+    return {"tracks": tracks, "albums": albums}
+
+
+def _format_bytes(n: int) -> str:
+    """Human-readable byte size."""
+    if n >= 1024**3:
+        return f"{n / 1024**3:.1f} GB"
+    if n >= 1024**2:
+        return f"{n / 1024**2:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+def format_stats(result: StatsResult, output_format: str = "text") -> str:
+    """Render stats result as text, json, or ndjson."""
+    _validate_output_format(output_format)
+    if output_format == "json":
+        return _json(result.to_dict())
+    if output_format == "ndjson":
+        return _json_line(result.to_dict()) + "\n"
+
+    # Text format
+    lines = [
+        result.root,
+        f"  Albums:      {result.albums:>6d}",
+        f"  Tracks:      {result.tracks:>6d}",
+        f"  Files:       {result.total_files:>6d}  "
+        f"({result.audio_files} audio, {result.non_audio_files} side files)",
+        f"  Total size:  {_format_bytes(result.total_bytes):>6s}",
+        f"  Audio size:  {_format_bytes(result.audio_bytes):>6s}",
+    ]
+
+    if result.format_histogram:
+        lines.append("")
+        lines.append("  Formats:")
+        for entry in result.format_histogram:
+            ext = entry["ext"].lstrip(".")
+            count = entry["count"]
+            pct = count / result.tracks * 100 if result.tracks else 0
+            size = _format_bytes(entry["bytes"])
+            lines.append(f"    {ext:<8s} {count:>5d}  ({pct:>5.1f}%)  {size:>8s}")
+
+    if result.asset_histogram:
+        lines.append("")
+        lines.append("  Side files:")
+        for entry in result.asset_histogram:
+            kind = entry["kind"]
+            count = entry["count"]
+            pct = count / result.non_audio_files * 100 if result.non_audio_files else 0
+            size = _format_bytes(entry["bytes"])
+            lines.append(f"    {kind:<12s} {count:>5d}  ({pct:>5.1f}%)  {size:>8s}")
+
+    if result.provenance["albums"]:
+        cue = result.provenance["albums_with_cue"]
+        log = result.provenance["albums_with_eac_log"]
+        albums = result.provenance["albums"]
+        lines.append("")
+        lines.append(
+            f"  Provenance: {cue} / {albums} albums with CUE, "
+            f"{log} / {albums} with EAC/log"
+        )
+
+    if result.tag_coverage:
+        lines.append("")
+        lines.append("  Tag coverage:")
+        for field, counts in result.tag_coverage.items():
+            have = counts["have"]
+            total = counts["total"]
+            pct = have / total * 100 if total else 0
+            lines.append(f"    {field:<14s} {have:>5d} / {total:<5d}  ({pct:>5.1f}%)")
+
+    if result.classifications:
+        lines.append("")
+        lines.append("  Media profiles:")
+        for kind, count in result.classifications.items():
+            lines.append(f"    {kind:<14s} {count:>5d}")
+
+    if result.index_coverage is not None:
+        indexed = result.index_coverage["indexed"]
+        stale = result.index_coverage.get("stale", 0)
+        missing = result.index_coverage.get("missing", 0)
+        total = result.index_coverage["total"]
+        lines.append("")
+        lines.append(
+            f"  Index: {indexed} / {total} current"
+            f"{f', {stale} stale' if stale else ''}"
+            f"{f', {missing} missing' if missing else ''}"
+        )
+
+    if result.loudness_coverage is not None:
+        lc = result.loudness_coverage
+        lines.append(f"  Loudness: {lc['tracks']} tracks, {lc['albums']} albums analyzed")
+
+    return "\n".join(lines) + "\n"
+
+
 def _audit_album_structure(
     root: Path,
     album_dir: Path,
@@ -850,8 +1760,12 @@ def _audit_album_structure(
     *,
     audit_index: _AuditIndex | None = None,
     ignore_policy: IgnorePolicy | None = None,
+    profile: MediaProfile = MEDIA_PROFILES["music"],
 ) -> None:
-    if len(rel_parts) > 2:
+    if not profile.check_year_structure:
+        return
+    layout_parts = _album_layout_parts(rel_parts)
+    if len(layout_parts) > 2:
         return
 
     year_match = ALBUM_YEAR_RE.search(album_dir.name)
@@ -909,7 +1823,14 @@ def _audit_album_structure(
         ))
 
 
-def _audit_album_provenance(album_dir: Path, findings: list[Finding]) -> None:
+def _audit_album_provenance(
+    album_dir: Path,
+    findings: list[Finding],
+    *,
+    profile: MediaProfile = MEDIA_PROFILES["music"],
+) -> None:
+    if not profile.check_provenance:
+        return
     cue_files = _cue_files(album_dir)
     log_files = _eac_logs(album_dir)
     if not cue_files:
@@ -942,11 +1863,12 @@ def _audit_tracks(
     include_info: bool,
     audit_index: _AuditIndex | None = None,
     ignore_policy: IgnorePolicy | None = None,
+    profile: MediaProfile = MEDIA_PROFILES["music"],
 ) -> None:
     for track in _direct_audio_files(album_dir, ignore_policy):
         tags = _safe_read_tags(track, audit_index) if include_warnings else Tags()
         if include_warnings:
-            missing = _missing_required_tags(tags)
+            missing = _missing_required_tags(tags, profile.required_tags)
         else:
             missing = []
         if include_warnings and missing:
@@ -965,14 +1887,14 @@ def _audit_tracks(
                 }],
             ))
 
-        match = TRACK_FILENAME_RE.match(track.name)
+        match = profile.filename_re.match(track.name)
         if include_info and match is None:
             findings.append(_finding(
                 "tracks.filename_pattern",
                 "info",
                 [track],
-                'Filename does not follow "NN Title.ext".',
-                {"filename": track.name, "expected_pattern": "NN Title.ext"},
+                f'Filename does not follow "{profile.filename_description}".',
+                {"filename": track.name, "expected_pattern": profile.filename_description},
                 confidence=1.0,
                 fixable=True,
                 suggested_actions=[{
@@ -986,8 +1908,14 @@ def _audit_tracks(
         if match is None:
             continue
 
-        file_track_number = int(match.group("number"))
-        if include_warnings and tags.track_number is not None and tags.track_number != file_track_number:
+        file_track_number = int(match.group("number")) if profile.check_track_number_match else None
+        if (
+            profile.check_track_number_match
+            and include_warnings
+            and file_track_number is not None
+            and tags.track_number is not None
+            and tags.track_number != file_track_number
+        ):
             findings.append(_finding(
                 "tags.track_number_mismatch",
                 "warning",
@@ -1548,11 +2476,76 @@ def _candidate_duplicate_keys(
     return keys
 
 
+def _validate_path_move_conflicts(actions: Any) -> None:
+    """Reject path moves whose sources or destinations overlap."""
+    moves: list[tuple[str, Path, Path]] = []
+    destinations: dict[str, str] = {}
+    for action in actions:
+        if action["type"] in {"ignore_finding", "write_tags"}:
+            continue
+        source = Path(action["source"])
+        destination = Path(action["destination"])
+        action_id = action["action_id"]
+
+        if _path_is_self_or_descendant(destination, source):
+            raise ValidationError(
+                f"action {action_id} destination is inside its source: {destination}"
+            )
+
+        dest_key = str(destination)
+        previous = destinations.get(dest_key)
+        if previous is not None:
+            raise ValidationError(
+                f"actions {previous} and {action_id} have the same destination: "
+                f"{destination}"
+            )
+        destinations[dest_key] = action_id
+        moves.append((action_id, source, destination))
+
+    for i, (left_id, left_source, left_dest) in enumerate(moves):
+        for right_id, right_source, right_dest in moves[i + 1:]:
+            if (
+                _path_is_self_or_descendant(left_source, right_source)
+                or _path_is_self_or_descendant(right_source, left_source)
+            ):
+                raise ValidationError(
+                    f"actions {left_id} and {right_id} move overlapping sources: "
+                    f"{left_source} / {right_source}"
+                )
+            if (
+                _path_is_self_or_descendant(left_dest, right_dest)
+                or _path_is_self_or_descendant(right_dest, left_dest)
+            ):
+                raise ValidationError(
+                    f"actions {left_id} and {right_id} move to overlapping "
+                    f"destinations: {left_dest} / {right_dest}"
+                )
+            if _path_is_self_or_descendant(left_dest, right_source):
+                raise ValidationError(
+                    f"action {left_id} destination overlaps action {right_id} "
+                    f"source: {left_dest}"
+                )
+            if _path_is_self_or_descendant(right_dest, left_source):
+                raise ValidationError(
+                    f"action {right_id} destination overlaps action {left_id} "
+                    f"source: {right_dest}"
+                )
+
+
+def _path_is_self_or_descendant(path: Path, ancestor: Path) -> bool:
+    try:
+        path.relative_to(ancestor)
+    except ValueError:
+        return False
+    return True
+
+
 def _validate_action(
     raw_action: Any,
     index: int,
     library_root: Path,
     quarantine_dir: Path,
+    source_roots: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     if not isinstance(raw_action, dict):
         raise ValidationError(f"action {index} must be an object")
@@ -1596,7 +2589,10 @@ def _validate_action(
     if not isinstance(source_value, str) or not source_value:
         raise ValidationError(f"action {index} requires source")
     source = Path(source_value).resolve(strict=False)
-    _validate_source(source, library_root, index)
+    if action_type in {"copy_album_dir", "copy_file"}:
+        _validate_source_in_roots(source, source_roots or (library_root,), index)
+    else:
+        _validate_source(source, library_root, index)
 
     if action_type == "quarantine":
         destination_value = raw_action.get("destination")
@@ -1615,9 +2611,9 @@ def _validate_action(
     if destination.exists():
         raise ValidationError(f"action {index} destination already exists: {destination}")
 
-    if action_type in {"rename_track_file", "move_file"} and not source.is_file():
+    if action_type in {"rename_track_file", "move_file", "copy_file"} and not source.is_file():
         raise ValidationError(f"action {index} source must be a file: {source}")
-    if action_type == "rename_album_dir" and not source.is_dir():
+    if action_type in {"rename_album_dir", "copy_album_dir"} and not source.is_dir():
         raise ValidationError(f"action {index} source must be a directory: {source}")
 
     action["source"] = str(source)
@@ -1638,6 +2634,12 @@ def _execute_action(action: dict[str, Any]) -> None:
     source = Path(action["source"])
     destination = Path(action["destination"])
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if action_type == "copy_file":
+        shutil.copy2(source, destination)
+        return
+    if action_type == "copy_album_dir":
+        shutil.copytree(source, destination)
+        return
     shutil.move(str(source), str(destination))
 
 
@@ -1648,7 +2650,7 @@ def _relocate_action_paths(
     """Update DB path references after a filesystem move."""
     if conn is None:
         return None
-    if action["type"] in {"ignore_finding", "write_tags"}:
+    if action["type"] in {"ignore_finding", "write_tags", "copy_file", "copy_album_dir"}:
         return None
     source = action.get("source")
     destination = action.get("destination")
@@ -1676,7 +2678,7 @@ def _action_warnings(
             )
 
     source = action.get("source")
-    if conn is not None and source:
+    if conn is not None and source and action["type"] not in {"copy_file", "copy_album_dir"}:
         refs = db.find_tape_references(conn, source)
         if refs:
             projects = sorted({name for name, _ in refs})
@@ -1865,6 +2867,28 @@ def _audio_files_under(
     return sorted(files)
 
 
+def _files_under(
+    root: Path,
+    ignore_policy: IgnorePolicy | None = None,
+) -> list[Path]:
+    if root.is_file():
+        return [
+            root.resolve()
+        ] if not _is_ignored(root, ignore_policy, is_dir=False) else []
+
+    files = []
+    for current, dirs, names in root.walk():
+        dirs[:] = [
+            name for name in dirs
+            if not _is_ignored(current / name, ignore_policy, is_dir=True)
+        ]
+        for name in names:
+            candidate = current / name
+            if not _is_ignored(candidate, ignore_policy, is_dir=False):
+                files.append(candidate.resolve())
+    return sorted(files)
+
+
 def _direct_audio_files(
     path: Path,
     ignore_policy: IgnorePolicy | None = None,
@@ -1909,10 +2933,13 @@ def _eac_logs(path: Path) -> list[Path]:
     return sorted(
         p.resolve()
         for p in path.iterdir()
-        if p.is_file()
-        and p.suffix.lower() == ".log"
-        and ("eac" in p.name.lower() or p.name.lower() != "accuraterip.log")
+        if p.is_file() and _is_eac_log(p)
     )
+
+
+def _is_eac_log(path: Path) -> bool:
+    name = path.name.lower()
+    return path.suffix.lower() == ".log" and ("eac" in name or name != "accuraterip.log")
 
 
 def _nearest_parent_album(path: Path, albums: set[Path]) -> Path | None:
@@ -1929,19 +2956,25 @@ def _relative_parts(path: Path, root: Path) -> tuple[str, ...]:
         return path.parts
 
 
-def _missing_required_tags(tags: Tags) -> list[str]:
-    missing = []
-    if not tags.artist:
-        missing.append("artist")
-    if not tags.album:
-        missing.append("album")
-    if not tags.title:
-        missing.append("title")
-    if tags.track_number is None:
-        missing.append("tracknumber")
-    if tags.year is None:
-        missing.append("date")
-    return missing
+def _album_layout_parts(rel_parts: tuple[str, ...]) -> tuple[str, ...]:
+    """Return album path parts after an optional media-kind subtree prefix."""
+    if rel_parts and rel_parts[0] in MEDIA_KIND_SUBTREES.values():
+        return rel_parts[1:]
+    return rel_parts
+
+
+def _missing_required_tags(
+    tags: Tags,
+    required: tuple[str, ...] = _MUSIC_REQUIRED,
+) -> list[str]:
+    fields = {
+        "artist": tags.artist,
+        "album": tags.album,
+        "title": tags.title,
+        "tracknumber": tags.track_number,
+        "date": tags.year,
+    }
+    return [name for name in required if not fields.get(name)]
 
 
 def _title_from_filename(path: Path) -> str:
@@ -2087,10 +3120,44 @@ def _coerce_paths(value: Any, index: int) -> list[Path]:
     raise ValidationError(f"action {index} requires path, paths, or source")
 
 
+def _coerce_source_roots(value: Any, library_root: Path) -> tuple[Path, ...]:
+    if value is None:
+        return (library_root,)
+    if isinstance(value, str):
+        raw_roots = [value]
+    elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+        raw_roots = value
+    else:
+        raise ValidationError("source_roots must be a string or list of strings")
+
+    roots = [library_root]
+    for raw_root in raw_roots:
+        root = Path(raw_root).resolve(strict=False)
+        if not root.exists():
+            raise PathNotFoundError(f"source_root does not exist: {root}")
+        roots.append(root)
+    return tuple(dict.fromkeys(roots))
+
+
 def _validate_source(source: Path, library_root: Path, index: int) -> None:
     _validate_inside(source, library_root, f"action {index} source")
     if not source.exists():
         raise PathNotFoundError(f"action {index} source does not exist: {source}")
+
+
+def _validate_source_in_roots(
+    source: Path,
+    source_roots: tuple[Path, ...],
+    index: int,
+) -> None:
+    if not source.exists():
+        raise PathNotFoundError(f"action {index} source does not exist: {source}")
+    if any(_path_is_self_or_descendant(source, root) for root in source_roots):
+        return
+    roots = ", ".join(str(root) for root in source_roots)
+    raise ValidationError(
+        f"action {index} source must stay inside one of: {roots}: {source}"
+    )
 
 
 def _validate_inside(path: Path, root: Path, label: str) -> None:

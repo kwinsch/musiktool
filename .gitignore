@@ -16,6 +16,7 @@ wheels/
 # Internal docs
 SENSITIVE.md
 CLAUDE.md
+docs/library-operations-handoff.md
 
 # Personal Python version pin
 .python-version

@@ -2,12 +2,14 @@
 
 import pytest
 
+from musiktool.loudness import (
+    compute_gain as _compute_gain,
+    compute_gain_with_limiter as _compute_gain_with_limiter,
+)
 from musiktool.tape import (
     AnalysisResult,
     SideItem,
     _compute_compressor_params,
-    _compute_gain,
-    _compute_gain_with_limiter,
     _capacity_status,
     _format_cue_time,
     _format_deck_time,

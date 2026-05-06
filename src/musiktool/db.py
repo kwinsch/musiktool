@@ -3,9 +3,8 @@
 import sqlite3
 from pathlib import Path
 
+from musiktool.config import get_config
 from musiktool.constants import MEDIUM_PRESETS
-
-DEFAULT_DB_DIR = Path.home() / ".local" / "share" / "musiktool"
 
 HARD_CLIP_DEFAULT_PEAK_CEILING_DBTP = -1.0
 LEGACY_HARD_CLIP_PEAK_CEILING_DBTP = 0.0
@@ -122,9 +121,14 @@ CREATE INDEX IF NOT EXISTS idx_tag_facts_artist_album ON tag_facts(artist, album
 """
 
 
+def default_data_dir() -> Path:
+    """Return configured data directory."""
+    return get_config().data_dir
+
+
 def default_db_path() -> Path:
-    """Return default analytics DB path (~/.local/share/musiktool/analytics.db)."""
-    return DEFAULT_DB_DIR / "analytics.db"
+    """Return default analytics DB path."""
+    return default_data_dir() / "analytics.db"
 
 
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
@@ -212,6 +216,13 @@ def get_tracks_for_album(
         "SELECT * FROM track_loudness WHERE album_path = ? ORDER BY path",
         (album_path,),
     ).fetchall()
+
+
+def get_album(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
+    """Get album loudness row by path."""
+    return conn.execute(
+        "SELECT * FROM album_loudness WHERE path = ?", (path,),
+    ).fetchone()
 
 
 def upsert_track(
@@ -504,6 +515,72 @@ def index_stats(conn: sqlite3.Connection) -> dict[str, int]:
             "SELECT COUNT(*) FROM library_classification",
         ).fetchone()[0],
     }
+
+
+def prune_missing(conn: sqlite3.Connection, root: str) -> dict[str, int]:
+    """Remove index entries for paths that no longer exist on disk.
+
+    Checks indexed_files and library_classification under *root*, deletes
+    rows from all related tables where the path no longer exists on the
+    filesystem. Returns count of pruned rows per table.
+    """
+    counts: dict[str, int] = {}
+
+    # Prune file-level tables
+    rows = conn.execute(
+        "SELECT path FROM indexed_files WHERE path LIKE ? || '%'",
+        (root,),
+    ).fetchall()
+    missing_files = [row[0] for row in rows if not Path(row[0]).exists()]
+
+    if missing_files:
+        tables = [
+            ("indexed_files", "path"),
+            ("audio_facts", "path"),
+            ("tag_facts", "path"),
+            ("track_loudness", "path"),
+        ]
+        for table, column in tables:
+            for path in missing_files:
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE {column} = ?",  # noqa: S608
+                    (path,),
+                )
+                if cursor.rowcount > 0:
+                    counts[table] = counts.get(table, 0) + cursor.rowcount
+
+        # Prune album_loudness for albums with no remaining tracks
+        album_paths = {str(Path(p).parent) for p in missing_files}
+        for album_path in album_paths:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM track_loudness WHERE album_path = ?",
+                (album_path,),
+            ).fetchone()[0]
+            if remaining == 0:
+                cursor = conn.execute(
+                    "DELETE FROM album_loudness WHERE path = ?",
+                    (album_path,),
+                )
+                if cursor.rowcount > 0:
+                    counts["album_loudness"] = counts.get("album_loudness", 0) + cursor.rowcount
+
+    # Prune library_classification for paths that no longer exist
+    class_rows = conn.execute(
+        "SELECT subject_path FROM library_classification WHERE subject_path LIKE ? || '%'",
+        (root,),
+    ).fetchall()
+    missing_class = [row[0] for row in class_rows if not Path(row[0]).exists()]
+    for path in missing_class:
+        cursor = conn.execute(
+            "DELETE FROM library_classification WHERE subject_path = ?",
+            (path,),
+        )
+        if cursor.rowcount > 0:
+            counts["library_classification"] = counts.get("library_classification", 0) + cursor.rowcount
+
+    if counts:
+        conn.commit()
+    return counts
 
 
 # --- Tape project helpers ---

@@ -49,7 +49,7 @@ class IndexScanSummary:
 
 def default_sidecar_root() -> Path:
     """Return the default out-of-tree sidecar root."""
-    return db.DEFAULT_DB_DIR / "sidecars"
+    return db.default_data_dir() / "sidecars"
 
 
 def scan_path(

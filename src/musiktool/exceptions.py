@@ -35,5 +35,21 @@ class InvalidPositionError(ValidationError):
     """Position argument is out of range for the current project items."""
 
 
+class RenderNotFoundError(ValidationError):
+    """No rendered output found for a tape project."""
+
+
 class AudioReadError(MusiktoolError):
     """Failed to read audio file (duration, sample rate, etc.)."""
+
+
+class MpvNotFoundError(MusiktoolError):
+    """mpv binary not found on PATH."""
+
+
+class MpvConnectionError(MusiktoolError):
+    """Failed to connect to or communicate with mpv."""
+
+
+class MpvCommandError(MusiktoolError):
+    """mpv command returned an error (bad filter, unsupported file, etc.)."""

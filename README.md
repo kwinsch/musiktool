@@ -50,6 +50,8 @@ The library workflow is split into three phases:
 - `index` — sidecar-backed file index with BLAKE3 hashes and Chromaprint fingerprints
 - `loudness` — quick per-track or per-album EBU R128 measurement
 - `audit` / `inspect` / `propose` / `apply` — agent-facing library audit with validated fix plans
+- `stats` — active library overview with audio formats, side files, provenance, tag coverage, and index coverage
+- `itunes` — parse old iTunes XML libraries, list albums, and generate copy-only import plans
 - Chromaprint similarity matching (BER) for detecting transcoded duplicates (FLAC vs M4A)
 
 The library model uses media-kind separation (music, radio, audiobooks, podcasts)
@@ -70,6 +72,21 @@ all gain decisions use album-level integrated loudness, never per-track.
 
 See `docs/tape-cli.md` for the command reference.
 
+### Playback (`musiktool play` / `musiktool player`)
+
+Non-blocking playback via mpv with EBU R128 loudness normalization (-14 LUFS
+target). Uses album-level gain — all tracks in an album share one gain value,
+preserving the mastering intent.
+
+- `play <file|album>` — play with automatic gain normalization from analytics DB
+- `play --queue` / `--next` — append or insert into running playlist
+- `player status|pause|skip|prev|stop` — control running mpv instance
+- `tape play <name>` — play rendered tape output or source tracks with processing
+- Graceful degradation: plays without normalization if loudness data is missing
+
+mpv runs as a background subprocess with JSON IPC — the agent conversation
+continues while music plays.
+
 ### Calibration
 
 - `calibrate` — generate reference tones for setting deck VU meters
@@ -78,11 +95,43 @@ See `docs/tape-cli.md` for the command reference.
 ## Planned
 
 - **Playlists** — named track lists, M3U export, agent-buildable from prompts
-- **Playback** — `musiktool play <album|playlist|tape>` via PipeWire/mpv
-- **Profile-aware audit** — separate rules for music, radio, audiobook, podcast
-- **Operator report** — grouped text output for day-to-day use without agent
 
 No UI is planned. The CLI + agent conversation is the interface.
+
+## Dependencies
+
+**Python**: 3.13+
+
+**System packages** (must be on PATH):
+
+| Tool | Used for | Required |
+|------|----------|----------|
+| `ffmpeg` | EBU R128 measurement, format conversion, tape rendering | Yes |
+| `mpv` | Playback (`play`, `player`, `tape play`) | For playback |
+| `fpcalc` | Chromaprint fingerprinting (`identify`, `index --fingerprint`) | For identification |
+| `shnsplit` | Splitting single-file rips via CUE sheet | For CUE splitting |
+| `cuetag.sh` | Writing tags from CUE to split tracks | For CUE splitting |
+| `mac` | Monkey's Audio (APE) decoding | For APE files only |
+
+On Arch Linux: `pacman -S ffmpeg mpv chromaprint shntool cuetools`
+
+On Debian/Ubuntu: `apt install ffmpeg mpv libchromaprint-tools shntool cuetools`
+
+## Configuration
+
+musiktool stores its data in `~/.local/share/musiktool/` by default (analytics
+DB, mpv socket, sidecar cache). Machine-specific settings go in
+`~/.config/musiktool/config.toml`:
+
+```toml
+# Where rendered tape masters live (required for 'tape play' without --render-dir)
+render_dir = "/path/to/rendered/output"
+
+# Override data directory (default: ~/.local/share/musiktool)
+# data_dir = "/path/to/data"
+```
+
+Both paths respect `XDG_CONFIG_HOME` and `XDG_DATA_HOME` if set.
 
 ## Quick Start
 
