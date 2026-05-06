@@ -122,8 +122,7 @@ musiktool audit <staging_path> --against <curated_library> --format json
 
 This detects `duplicates.source_already_curated` findings — albums in the
 staging area that already exist in the curated library (by hash, fingerprint,
-or strong metadata match). Useful before importing from iTunes, incoming, or
-any external source.
+or strong metadata match). Useful before importing from any external source.
 
 #### Disc-track filename patterns
 
@@ -223,9 +222,6 @@ action, it is an agent decision, not a tool decision.
 ## Safety
 
 - **Always dry-run** before executing any fix plan.
-- **Snapshot before bulk changes.** If your filesystem supports snapshots (ZFS,
-  Btrfs, LVM), take one before applying large fix plans. musiktool does not
-  manage snapshots itself.
 - **Never delete.** Use `quarantine` — it moves items to `_quarantine/` within
   the library root, preserving them for manual review.
 - **Tape project references update automatically.** When `apply --execute`
@@ -239,6 +235,29 @@ action, it is an agent decision, not a tool decision.
 - **Preserve provenance.** CUE sheets and EAC logs must never be deleted or
   separated from their album. They prove rip quality and enable exact disc
   reconstruction.
+
+## Importing from External Sources
+
+When importing albums from an external source, the agent **must** check the
+curated library for existing copies before executing any copy plan.
+`itunes propose` generates mechanical copy actions — it has no knowledge of
+what the library already contains. That judgment is the agent's responsibility.
+
+**Required sequence:**
+
+1. Check what the library already has for this artist/album (by listing the
+   target directory or running `audit --against`).
+2. If the album already exists in a superior or equal format (FLAC > M4A > MP3),
+   do not import. The curated copy wins.
+3. If the album does not exist in the library, proceed with the import proposal
+   and `apply`.
+4. If the library has an inferior format (e.g. MP3) and the import source has
+   a better one (e.g. AAC), the agent decides whether to import and quarantine
+   the old copy — but this is a judgment call, not automatic.
+
+Import tools like `itunes propose` are mechanical. The agent provides the
+intelligence: knowing what's already there, comparing formats, and deciding
+whether an import adds value.
 
 ## Output Formats
 

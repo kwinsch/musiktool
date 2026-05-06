@@ -580,9 +580,9 @@ musiktool apply fix-plan.json --execute
 ### Staging Source Ingest
 
 ```
-musiktool audit ~/Music/incoming --against ~/Music/lib --format ndjson > incoming.ndjson
+musiktool audit ~/Music/incoming --against ~/Music/lib --format ndjson > staging.ndjson
 musiktool inspect "~/Music/incoming/Apocalyptica" --against ~/Music/lib --format json
-musiktool apply incoming-fix-plan.json --dry-run
+musiktool apply staging-fix-plan.json --dry-run
 ```
 
 ### Mechanical Fixes (Propose)
